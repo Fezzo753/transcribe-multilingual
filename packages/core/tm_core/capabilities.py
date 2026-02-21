@@ -14,6 +14,8 @@ class ModelCapability:
     supports_diarization: bool
     supports_speaker_count: bool
     supports_auto_language: bool
+    supports_translation_native: bool
+    supports_batch: bool
     supported_target_languages: list[str] | str
 
 
@@ -38,6 +40,8 @@ PROVIDER_CAPABILITIES: dict[ProviderName, ProviderCapability] = {
                 supports_diarization=False,
                 supports_speaker_count=False,
                 supports_auto_language=True,
+                supports_translation_native=False,
+                supports_batch=True,
                 supported_target_languages=_ALL_LANGUAGES,
             ),
             ModelCapability(
@@ -47,6 +51,8 @@ PROVIDER_CAPABILITIES: dict[ProviderName, ProviderCapability] = {
                 supports_diarization=False,
                 supports_speaker_count=False,
                 supports_auto_language=True,
+                supports_translation_native=False,
+                supports_batch=True,
                 supported_target_languages=_ALL_LANGUAGES,
             ),
             ModelCapability(
@@ -56,6 +62,8 @@ PROVIDER_CAPABILITIES: dict[ProviderName, ProviderCapability] = {
                 supports_diarization=False,
                 supports_speaker_count=False,
                 supports_auto_language=True,
+                supports_translation_native=False,
+                supports_batch=True,
                 supported_target_languages=_ALL_LANGUAGES,
             ),
         ],
@@ -71,6 +79,8 @@ PROVIDER_CAPABILITIES: dict[ProviderName, ProviderCapability] = {
                 supports_diarization=False,
                 supports_speaker_count=False,
                 supports_auto_language=True,
+                supports_translation_native=True,
+                supports_batch=True,
                 supported_target_languages=_ALL_LANGUAGES,
             ),
             ModelCapability(
@@ -80,6 +90,8 @@ PROVIDER_CAPABILITIES: dict[ProviderName, ProviderCapability] = {
                 supports_diarization=False,
                 supports_speaker_count=False,
                 supports_auto_language=True,
+                supports_translation_native=True,
+                supports_batch=True,
                 supported_target_languages=_ALL_LANGUAGES,
             ),
         ],
@@ -95,6 +107,8 @@ PROVIDER_CAPABILITIES: dict[ProviderName, ProviderCapability] = {
                 supports_diarization=True,
                 supports_speaker_count=True,
                 supports_auto_language=True,
+                supports_translation_native=False,
+                supports_batch=True,
                 supported_target_languages=_ALL_LANGUAGES,
             ),
             ModelCapability(
@@ -104,6 +118,8 @@ PROVIDER_CAPABILITIES: dict[ProviderName, ProviderCapability] = {
                 supports_diarization=True,
                 supports_speaker_count=True,
                 supports_auto_language=True,
+                supports_translation_native=False,
+                supports_batch=True,
                 supported_target_languages=_ALL_LANGUAGES,
             ),
         ],
@@ -119,6 +135,8 @@ PROVIDER_CAPABILITIES: dict[ProviderName, ProviderCapability] = {
                 supports_diarization=True,
                 supports_speaker_count=False,
                 supports_auto_language=True,
+                supports_translation_native=True,
+                supports_batch=True,
                 supported_target_languages=_ALL_LANGUAGES,
             ),
         ],
@@ -159,3 +177,10 @@ def provider_requires_key(provider: str) -> bool:
         raise ValueError(f"unsupported provider '{provider}'")
     return PROVIDER_CAPABILITIES[provider].requires_api_key
 
+
+def provider_enabled(provider: str, app_mode: str = "local") -> bool:
+    if provider not in PROVIDER_CAPABILITIES:
+        return False
+    if app_mode == "cloudflare" and provider == "whisper-local":
+        return False
+    return True

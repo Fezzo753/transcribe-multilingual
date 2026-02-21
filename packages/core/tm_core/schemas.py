@@ -7,7 +7,11 @@ from pydantic import BaseModel, Field, field_validator
 
 ProviderName = Literal["whisper-local", "openai", "elevenlabs-scribe", "deepgram"]
 OutputFormat = Literal["srt", "vtt", "html", "txt", "json"]
-JobStatus = Literal["queued", "running", "completed", "failed"]
+ArtifactVariant = Literal["source", "translated", "combined"]
+ArtifactKind = Literal["source", "translated", "combined", "bundle"]
+InputSource = Literal["upload", "folder"]
+JobStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
+FileStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
 
 
 class JobCreateRequest(BaseModel):
@@ -25,6 +29,12 @@ class JobCreateRequest(BaseModel):
     @classmethod
     def unique_formats(cls, value: list[OutputFormat]) -> list[OutputFormat]:
         return list(dict.fromkeys(value))
+
+
+class BatchJobCreateRequest(JobCreateRequest):
+    files_count: int = Field(default=1, ge=1)
+    batch_label: str | None = None
+    local_folder: str | None = None
 
 
 class TranscriptSegment(BaseModel):
@@ -47,12 +57,30 @@ class TranscriptDocument(BaseModel):
 
 class ArtifactInfo(BaseModel):
     id: str
+    file_id: str | None = None
     name: str
     mime_type: str
-    kind: Literal["source", "translated", "bundle"]
+    kind: ArtifactKind
+    format: OutputFormat | Literal["zip"]
+    variant: ArtifactVariant | None = None
+    size_bytes: int | None = None
 
 
-class JobStatusResponse(BaseModel):
+class FileJobStatus(BaseModel):
+    id: str
+    input_name: str
+    input_source: InputSource
+    status: FileStatus
+    detected_language: str | None = None
+    duration_sec: float | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    translation_warning_code: str | None = None
+    translation_warning_message: str | None = None
+    artifacts: list[ArtifactInfo] = Field(default_factory=list)
+
+
+class BatchJobStatusResponse(BaseModel):
     id: str
     status: JobStatus
     provider: ProviderName
@@ -64,6 +92,9 @@ class JobStatusResponse(BaseModel):
     duration_sec: float | None = None
     error_code: str | None = None
     error_message: str | None = None
+    translation_warning_code: str | None = None
+    translation_warning_message: str | None = None
+    files: list[FileJobStatus] = Field(default_factory=list)
     artifacts: list[ArtifactInfo] = Field(default_factory=list)
     result: dict | None = None
 
@@ -78,3 +109,21 @@ class KeyStatus(BaseModel):
     configured: bool
     updated_at: datetime | None = None
 
+
+class AppSettingsResponse(BaseModel):
+    app_mode: str
+    sync_size_threshold_mb: int
+    retention_days: int
+    translation_fallback_order: list[ProviderName]
+    local_folder_allowlist: list[str] = Field(default_factory=list)
+
+
+class AppSettingsUpdateRequest(BaseModel):
+    sync_size_threshold_mb: int | None = Field(default=None, ge=1)
+    retention_days: int | None = Field(default=None, ge=1)
+    translation_fallback_order: list[ProviderName] | None = None
+    local_folder_allowlist: list[str] | None = None
+
+
+# Backwards alias for callers that still use the single-job name.
+JobStatusResponse = BatchJobStatusResponse

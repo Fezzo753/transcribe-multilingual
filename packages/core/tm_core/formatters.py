@@ -4,7 +4,7 @@ import json
 from html import escape
 from typing import Literal
 
-from tm_core.schemas import TranscriptDocument
+from tm_core.schemas import ArtifactVariant, OutputFormat, TranscriptDocument
 
 
 def _format_timestamp_srt(seconds: float) -> str:
@@ -95,3 +95,22 @@ def to_html(document: TranscriptDocument) -> str:
 def to_json(document: TranscriptDocument) -> str:
     return document.model_dump_json(indent=2)
 
+
+def render_format(document: TranscriptDocument, fmt: OutputFormat, variant: ArtifactVariant = "source") -> str:
+    if fmt == "srt":
+        if variant == "combined":
+            raise ValueError("combined variant is not supported for srt")
+        return to_srt(document, variant=variant)
+    if fmt == "vtt":
+        if variant == "combined":
+            raise ValueError("combined variant is not supported for vtt")
+        return to_vtt(document, variant=variant)
+    if fmt == "txt":
+        if variant == "combined":
+            raise ValueError("combined variant is not supported for txt")
+        return to_txt(document, variant=variant)
+    if fmt == "html":
+        return to_html(document)
+    if fmt == "json":
+        return to_json(document)
+    raise ValueError(f"unsupported format '{fmt}'")
