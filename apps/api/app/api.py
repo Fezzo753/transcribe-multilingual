@@ -192,12 +192,14 @@ def _is_allowed_folder(target: Path, allowlist: list[Path]) -> bool:
 def create_job_folder(
     body: FolderBatchRequest,
     settings: Settings = Depends(resolve_settings),
+    db: Database = Depends(get_db),
     service: JobService = Depends(get_job_service),
 ) -> BatchJobStatusResponse:
     if settings.app_mode != "local":
         raise HTTPException(status_code=400, detail="folder ingestion is available only in local mode")
     target_dir = Path(body.folder_path).resolve()
-    allowlist = settings.folder_allowlist
+    allowlist_raw = db.get_app_setting("local_folder_allowlist") or settings.local_folder_allowlist
+    allowlist = [Path(item.strip()).resolve() for item in allowlist_raw.split(",") if item.strip()]
     if not allowlist:
         raise HTTPException(status_code=400, detail="local folder allowlist is empty")
     if not _is_allowed_folder(target_dir, allowlist):

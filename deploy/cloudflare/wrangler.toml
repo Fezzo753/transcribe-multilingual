@@ -1,0 +1,30 @@
+name = "transcribe-multilingual"
+main = "src/index.ts"
+compatibility_date = "2026-02-21"
+
+[vars]
+APP_MODE = "cloudflare"
+SYNC_SIZE_THRESHOLD_MB = "20"
+RETENTION_DAYS = "7"
+TRANSLATION_FALLBACK_ORDER = "native,openai,deepgram"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "transcribe-multilingual"
+database_id = "replace-with-d1-database-id"
+
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "transcribe-multilingual-storage"
+
+[[queues.producers]]
+binding = "JOB_QUEUE"
+queue = "transcribe-jobs"
+
+[[queues.consumers]]
+queue = "transcribe-jobs"
+max_batch_size = 3
+max_batch_timeout = 5
+
+[triggers]
+crons = ["0 * * * *"]

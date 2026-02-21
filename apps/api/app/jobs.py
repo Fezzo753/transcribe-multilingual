@@ -54,6 +54,20 @@ class JobService:
             return "translated"
         return "combined"
 
+    def _effective_sync_threshold_mb(self) -> int:
+        raw = self._db.get_app_setting("sync_size_threshold_mb")
+        return int(raw) if raw else self._settings.sync_size_threshold_mb
+
+    def _effective_retention_days(self) -> int:
+        raw = self._db.get_app_setting("retention_days")
+        return int(raw) if raw else self._settings.retention_days
+
+    def _effective_fallback_order(self) -> list[str]:
+        raw = self._db.get_app_setting("translation_fallback_order")
+        if raw:
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        return self._settings.fallback_order
+
     def _to_artifact_info(self, row: dict) -> ArtifactInfo:
         return ArtifactInfo(
             id=row["id"],
@@ -181,7 +195,7 @@ class JobService:
             return True
         if len(inputs) > 1:
             return True
-        threshold = self._settings.sync_size_threshold_mb * 1024 * 1024
+        threshold = self._effective_sync_threshold_mb() * 1024 * 1024
         if threshold <= 0:
             return True
         return any(item.size_bytes > threshold for item in inputs)
@@ -223,7 +237,7 @@ class JobService:
         formats = options.get("formats") or ["json", "txt"]
         diarization_enabled = bool(options.get("diarization_enabled", False))
         speaker_count = options.get("speaker_count")
-        fallback_order = self._settings.fallback_order
+        fallback_order = self._effective_fallback_order()
         processed = 0
         failed = 0
 
@@ -344,7 +358,7 @@ class JobService:
         return self._build_job_response(job_id)
 
     def cleanup_expired(self) -> int:
-        cutoff = datetime.now(tz=UTC) - timedelta(days=self._settings.retention_days)
+        cutoff = datetime.now(tz=UTC) - timedelta(days=self._effective_retention_days())
         paths = self._db.delete_records_older_than(cutoff.isoformat())
         removed = 0
         for path_str in paths:
