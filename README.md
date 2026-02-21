@@ -1,33 +1,50 @@
 # Transcribe Multilingual
 
-Python-first multilingual transcription and translation platform with:
+Dual-profile multilingual transcription and translation platform.
 
-- Local Whisper (`faster-whisper`)
-- OpenAI transcription
-- ElevenLabs Scribe
-- Deepgram
+## Runtime Profiles
 
-It provides a FastAPI backend, an RQ worker, and a React web UI.
+1. Local profile:
+- FastAPI API + server-rendered UI
+- Redis/RQ worker for async jobs
+- SQLite metadata store
+- Local filesystem storage
+- Local Whisper (`faster-whisper`) + API providers
+
+2. Cloudflare profile:
+- Cloudflare Worker (Hono)
+- D1 metadata store
+- R2 storage
+- Queues for async jobs
+- Provider APIs only (`whisper-local` disabled)
+
+## Supported Providers
+
+- `whisper-local` (local profile only)
+- `openai`
+- `elevenlabs-scribe` (`scribe_v1`, `scribe_v2`)
+- `deepgram`
 
 ## Features
 
-- Upload audio/video and transcribe with a selected provider/model
-- Optional translation to a target language
-- Optional diarization and speaker count when supported
-- Output formats: `srt`, `vtt`, `html`, `txt`, `json`
-- Download individual artifacts or all selected outputs in a ZIP
-- Encrypted API key persistence in local settings DB
-- Hybrid processing model: sync for small jobs, async queue for larger jobs
+- Multi-file batch jobs
+- Optional translation to target language with fallback order
+- Outputs: `srt`, `vtt`, `html`, `txt`, `json`
+- Source + translated variants where applicable
+- ZIP bundle generation with flat prefixed naming
+- Encrypted API key persistence
+- Polling-based progress tracking
+- Retention cleanup (default 7 days)
 
-## Quick start (local)
+## Local Quick Start
 
-1. Install Python dependencies:
+1. Install dependencies:
 
 ```bash
 pip install -e ".[dev,local-whisper]"
 ```
 
-2. Start Redis (required for async queue):
+2. Start Redis:
 
 ```bash
 docker run --rm -p 6379:6379 redis:7-alpine
@@ -39,21 +56,36 @@ docker run --rm -p 6379:6379 redis:7-alpine
 uvicorn app.main:app --reload --app-dir apps/api
 ```
 
-4. Start worker (separate shell):
+4. Start worker:
 
 ```bash
 python -m apps.worker.run_worker
 ```
 
-5. Start web app:
+5. Open UI:
 
-```bash
-cd apps/web
-npm install
-npm run dev
-```
+- Jobs list: `http://localhost:8000/jobs`
+- New job: `http://localhost:8000/jobs/new`
+- Settings: `http://localhost:8000/settings`
 
-## Cloudflare profile
+## API Endpoints (local + cloud)
 
-See `deploy/cloudflare/README.md`. In Cloudflare mode, `whisper-local` is intentionally disabled.
+- `GET /api/capabilities`
+- `GET /api/settings/keys`
+- `PUT /api/settings/keys/{provider}`
+- `DELETE /api/settings/keys/{provider}`
+- `GET /api/settings/app`
+- `PUT /api/settings/app`
+- `POST /api/jobs`
+- `POST /api/jobs/from-folder` (local only)
+- `GET /api/jobs`
+- `GET /api/jobs/{job_id}`
+- `GET /api/jobs/{job_id}/artifacts`
+- `GET /api/jobs/{job_id}/artifacts/{artifact_id}`
+- `GET /api/jobs/{job_id}/bundle.zip`
+- `POST /api/jobs/{job_id}/cancel`
 
+## Deployment
+
+- Local details: `deploy/local/README.md`
+- Cloudflare details: `deploy/cloudflare/README.md`

@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 ProviderName = Literal["whisper-local", "openai", "elevenlabs-scribe", "deepgram"]
+TranslationBackend = Literal["native", "openai", "deepgram"]
 OutputFormat = Literal["srt", "vtt", "html", "txt", "json"]
 ArtifactVariant = Literal["source", "translated", "combined"]
 ArtifactKind = Literal["source", "translated", "combined", "bundle"]
@@ -114,14 +115,14 @@ class AppSettingsResponse(BaseModel):
     app_mode: str
     sync_size_threshold_mb: int
     retention_days: int
-    translation_fallback_order: list[ProviderName]
+    translation_fallback_order: list[TranslationBackend]
     local_folder_allowlist: list[str] = Field(default_factory=list)
 
 
 class AppSettingsUpdateRequest(BaseModel):
     sync_size_threshold_mb: int | None = Field(default=None, ge=1)
     retention_days: int | None = Field(default=None, ge=1)
-    translation_fallback_order: list[ProviderName] | None = None
+    translation_fallback_order: list[TranslationBackend] | None = None
     local_folder_allowlist: list[str] | None = None
 
 

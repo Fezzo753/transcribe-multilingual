@@ -1,0 +1,587 @@
+import JSZip from "jszip";
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+
+type ProviderName = "openai" | "elevenlabs-scribe" | "deepgram";
+type OutputFormat = "srt" | "vtt" | "html" | "txt" | "json";
+
+type Env = {
+  DB: D1Database;
+  STORAGE: R2Bucket;
+  JOB_QUEUE: Queue;
+  APP_MODE: string;
+  SYNC_SIZE_THRESHOLD_MB: string;
+  RETENTION_DAYS: string;
+  TRANSLATION_FALLBACK_ORDER: string;
+  TM_ENCRYPTION_KEY: string;
+};
+
+type TranscriptSegment = { id: number; start: number; end: number; text: string; translated_text?: string | null };
+type TranscriptDocument = { provider: ProviderName; model: string; detected_language?: string | null; segments: TranscriptSegment[] };
+
+const PROVIDERS = [
+  {
+    provider: "openai",
+    requires_api_key: true,
+    models: ["gpt-4o-mini-transcribe", "whisper-1"],
+  },
+  {
+    provider: "elevenlabs-scribe",
+    requires_api_key: true,
+    models: ["scribe_v1", "scribe_v2"],
+  },
+  {
+    provider: "deepgram",
+    requires_api_key: true,
+    models: ["nova-3"],
+  },
+];
+
+const app = new Hono<{ Bindings: Env }>();
+app.use("/api/*", cors());
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function uid(): string {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+function safePrefix(name: string): string {
+  const stem = name.replace(/\.[^/.]+$/, "").toLowerCase();
+  return stem.replace(/[^a-z0-9._-]+/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "") || "file";
+}
+
+function parseJson<T>(raw: string | null, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+async function getSetting(env: Env, key: string): Promise<string | null> {
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first<{ value: string }>();
+  return row?.value ?? null;
+}
+
+async function setSetting(env: Env, key: string, value: string): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+  )
+    .bind(key, value, nowIso())
+    .run();
+}
+
+async function importAesKey(secret: string): Promise<CryptoKey> {
+  let bytes: Uint8Array;
+  try {
+    bytes = Uint8Array.from(atob(secret), (c) => c.charCodeAt(0));
+  } catch {
+    bytes = enc.encode(secret);
+  }
+  if (bytes.length < 32) {
+    const padded = new Uint8Array(32);
+    padded.set(bytes.slice(0, 32));
+    bytes = padded;
+  }
+  if (bytes.length > 32) bytes = bytes.slice(0, 32);
+  return crypto.subtle.importKey("raw", bytes, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function encryptSecret(secret: string, plaintext: string): Promise<string> {
+  const key = await importAesKey(secret);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(plaintext));
+  return `${btoa(String.fromCharCode(...iv))}.${btoa(String.fromCharCode(...new Uint8Array(encrypted)))}`;
+}
+
+async function decryptSecret(secret: string, value: string): Promise<string> {
+  const [ivB64, payloadB64] = value.split(".");
+  const iv = Uint8Array.from(atob(ivB64), (c) => c.charCodeAt(0));
+  const payload = Uint8Array.from(atob(payloadB64), (c) => c.charCodeAt(0));
+  const key = await importAesKey(secret);
+  const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, payload);
+  return dec.decode(decrypted);
+}
+
+async function getProviderKey(env: Env, provider: ProviderName): Promise<string | null> {
+  const row = await env.DB.prepare("SELECT encrypted_key FROM api_keys WHERE provider = ?").bind(provider).first<{ encrypted_key: string }>();
+  if (!row) return null;
+  return decryptSecret(env.TM_ENCRYPTION_KEY, row.encrypted_key);
+}
+
+function tsSrt(seconds: number): string {
+  const full = Math.floor(seconds);
+  const h = Math.floor(full / 3600)
+    .toString()
+    .padStart(2, "0");
+  const m = Math.floor((full % 3600) / 60)
+    .toString()
+    .padStart(2, "0");
+  const s = (full % 60).toString().padStart(2, "0");
+  const ms = Math.floor((seconds - full) * 1000)
+    .toString()
+    .padStart(3, "0");
+  return `${h}:${m}:${s},${ms}`;
+}
+
+function tsVtt(seconds: number): string {
+  return tsSrt(seconds).replace(",", ".");
+}
+
+function render(document: TranscriptDocument, format: OutputFormat, variant: "source" | "translated" | "combined"): string {
+  if (format === "json") return `${JSON.stringify(document, null, 2)}\n`;
+  if (format === "html") {
+    const rows = document.segments
+      .map(
+        (segment) =>
+          `<tr><td>${segment.id}</td><td>${segment.start.toFixed(2)}</td><td>${segment.end.toFixed(2)}</td><td>${segment.text}</td><td>${segment.translated_text ?? ""}</td></tr>`,
+      )
+      .join("");
+    return `<!doctype html><html><body><table>${rows}</table></body></html>`;
+  }
+  if (format === "txt") {
+    return `${document.segments.map((s) => (variant === "translated" ? s.translated_text || s.text : s.text)).join("\n")}\n`;
+  }
+  if (format === "srt") {
+    return `${document.segments
+      .map((s, idx) => `${idx + 1}\n${tsSrt(s.start)} --> ${tsSrt(s.end)}\n${variant === "translated" ? s.translated_text || s.text : s.text}`)
+      .join("\n\n")}\n`;
+  }
+  return `WEBVTT\n\n${document.segments
+    .map((s) => `${tsVtt(s.start)} --> ${tsVtt(s.end)}\n${variant === "translated" ? s.translated_text || s.text : s.text}`)
+    .join("\n\n")}\n`;
+}
+
+async function transcribeOpenAI(apiKey: string, model: string, file: File, sourceLanguage: string): Promise<TranscriptDocument> {
+  const form = new FormData();
+  form.set("file", file, file.name);
+  form.set("model", model);
+  form.set("response_format", "verbose_json");
+  if (sourceLanguage !== "auto") form.set("language", sourceLanguage);
+  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: form,
+  });
+  const payload = (await response.json()) as Record<string, unknown>;
+  if (!response.ok) throw new Error(`openai transcription failed: ${JSON.stringify(payload)}`);
+  const segmentsRaw = (payload.segments as Array<Record<string, unknown>> | undefined) || [];
+  const segments = segmentsRaw.length
+    ? segmentsRaw.map((s, idx) => ({
+        id: Number(s.id ?? idx + 1),
+        start: Number(s.start ?? 0),
+        end: Number(s.end ?? 0),
+        text: String(s.text ?? ""),
+      }))
+    : [{ id: 1, start: 0, end: 0, text: String(payload.text ?? "") }];
+  return { provider: "openai", model, detected_language: (payload.language as string | undefined) || null, segments };
+}
+
+async function transcribeDeepgram(apiKey: string, model: string, file: File, sourceLanguage: string): Promise<TranscriptDocument> {
+  let url = `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(model)}&punctuate=true&smart_format=true`;
+  if (sourceLanguage !== "auto") url += `&language=${encodeURIComponent(sourceLanguage)}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Token ${apiKey}`, "Content-Type": "application/octet-stream" },
+    body: await file.arrayBuffer(),
+  });
+  const payload = (await response.json()) as Record<string, unknown>;
+  if (!response.ok) throw new Error(`deepgram transcription failed: ${JSON.stringify(payload)}`);
+  const channel = ((((payload.results as Record<string, unknown>)?.channels as Array<Record<string, unknown>>) || [])[0] || {}) as Record<
+    string,
+    unknown
+  >;
+  const alt = (((channel.alternatives as Array<Record<string, unknown>>) || [])[0] || {}) as Record<string, unknown>;
+  const transcript = String(alt.transcript || "");
+  return {
+    provider: "deepgram",
+    model,
+    detected_language: String((payload.results as Record<string, unknown>)?.detected_language || "") || null,
+    segments: [{ id: 1, start: 0, end: 0, text: transcript }],
+  };
+}
+
+async function transcribeElevenlabs(apiKey: string, model: string, file: File, sourceLanguage: string): Promise<TranscriptDocument> {
+  const form = new FormData();
+  form.set("file", file, file.name);
+  form.set("model_id", model);
+  if (sourceLanguage !== "auto") form.set("language_code", sourceLanguage);
+  const response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+    method: "POST",
+    headers: { "xi-api-key": apiKey },
+    body: form,
+  });
+  const payload = (await response.json()) as Record<string, unknown>;
+  if (!response.ok) throw new Error(`elevenlabs transcription failed: ${JSON.stringify(payload)}`);
+  return {
+    provider: "elevenlabs-scribe",
+    model,
+    detected_language: String(payload.language_code || "") || null,
+    segments: [{ id: 1, start: 0, end: 0, text: String(payload.text || "") }],
+  };
+}
+
+async function transcribe(env: Env, provider: ProviderName, model: string, file: File, sourceLanguage: string): Promise<TranscriptDocument> {
+  const key = await getProviderKey(env, provider);
+  if (!key) throw new Error(`missing API key for ${provider}`);
+  if (provider === "openai") return transcribeOpenAI(key, model, file, sourceLanguage);
+  if (provider === "deepgram") return transcribeDeepgram(key, model, file, sourceLanguage);
+  return transcribeElevenlabs(key, model, file, sourceLanguage);
+}
+
+async function applyTranslation(env: Env, provider: ProviderName, document: TranscriptDocument, target: string, source: string | null): Promise<TranscriptDocument> {
+  const order = ((await getSetting(env, "translation_fallback_order")) || env.TRANSLATION_FALLBACK_ORDER)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const backend of order) {
+    try {
+      let key: string | null = null;
+      if (backend === "native") key = await getProviderKey(env, provider);
+      if (backend === "openai") key = await getProviderKey(env, "openai");
+      if (backend === "deepgram") key = await getProviderKey(env, "deepgram");
+      if (!key) continue;
+      const translated: TranscriptSegment[] = [];
+      for (const segment of document.segments) {
+        if (backend === "openai" || (backend === "native" && provider === "openai")) {
+          const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: "gpt-4o-mini",
+              temperature: 0,
+              messages: [
+                { role: "system", content: "You are a translation engine. Return only translated text." },
+                { role: "user", content: `Translate this text${source ? ` from ${source}` : ""} to ${target}: ${segment.text}` },
+              ],
+            }),
+          });
+          const payload = (await response.json()) as Record<string, unknown>;
+          const choices = (payload.choices as Array<Record<string, unknown>> | undefined) || [];
+          const message = (choices[0]?.message as Record<string, unknown> | undefined) || {};
+          translated.push({ ...segment, translated_text: String(message.content || "").trim() });
+          continue;
+        }
+        if (backend === "deepgram" || (backend === "native" && provider === "deepgram")) {
+          const response = await fetch("https://api.deepgram.com/v1/translate", {
+            method: "POST",
+            headers: { Authorization: `Token ${key}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ text: segment.text, target_language: target, source_language: source }),
+          });
+          const payload = (await response.json()) as Record<string, unknown>;
+          translated.push({ ...segment, translated_text: String(payload.translated_text || "") });
+          continue;
+        }
+        translated.push({ ...segment, translated_text: segment.text });
+      }
+      return { ...document, segments: translated };
+    } catch {
+      continue;
+    }
+  }
+  return document;
+}
+
+async function processJob(env: Env, jobId: string): Promise<void> {
+  const job = await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<Record<string, unknown>>();
+  if (!job || ["completed", "failed", "cancelled"].includes(String(job.status))) return;
+  await env.DB.prepare("UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ?").bind(nowIso(), jobId).run();
+  const filesRes = await env.DB.prepare("SELECT * FROM job_files WHERE job_id = ? ORDER BY created_at ASC").bind(jobId).all<Record<string, unknown>>();
+  const options = parseJson<Record<string, unknown>>(String(job.options_json || "{}"), {});
+  const formats = ((options.formats as string[] | undefined) || ["json", "txt"]) as OutputFormat[];
+  let processed = 0;
+  let failed = 0;
+
+  for (const row of filesRes.results || []) {
+    const fileId = String(row.id);
+    await env.DB.prepare("UPDATE job_files SET status = 'running', updated_at = ? WHERE id = ?").bind(nowIso(), fileId).run();
+    try {
+      const object = await env.STORAGE.get(String(row.storage_path));
+      if (!object) throw new Error("missing upload blob");
+      const file = new File([await object.arrayBuffer()], String(row.input_name), { type: object.httpMetadata?.contentType });
+      let document = await transcribe(env, String(job.provider) as ProviderName, String(job.model), file, String(job.source_language));
+      if (Number(job.translation_enabled) && job.target_language) {
+        document = await applyTranslation(env, String(job.provider) as ProviderName, document, String(job.target_language), document.detected_language || null);
+      }
+      const translatedExists = document.segments.some((s) => Boolean(s.translated_text));
+      const prefix = safePrefix(String(row.input_name));
+      for (const format of formats) {
+        const variants = format === "srt" || format === "vtt" || format === "txt" ? ["source", ...(translatedExists ? ["translated"] : [])] : ["combined"];
+        for (const variant of variants) {
+          const name = format === "json" ? `${prefix}__transcript.json` : format === "html" ? `${prefix}__combined.html` : `${prefix}__${variant}.${format}`;
+          const body = render(document, format, variant as "source" | "translated" | "combined");
+          const path = `artifacts/${jobId}/${fileId}/${name}`;
+          await env.STORAGE.put(path, body, {
+            httpMetadata: { contentType: format === "json" ? "application/json" : format === "html" ? "text/html" : format === "vtt" ? "text/vtt" : "text/plain" },
+          });
+          await env.DB.prepare(
+            "INSERT INTO artifacts (id, job_id, file_id, format, variant, name, mime_type, kind, storage_path, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          )
+            .bind(
+              uid(),
+              jobId,
+              fileId,
+              format,
+              format === "json" || format === "html" ? null : variant,
+              name,
+              format === "json" ? "application/json" : format === "html" ? "text/html" : format === "vtt" ? "text/vtt" : "text/plain",
+              format === "json" || format === "html" ? "combined" : variant,
+              path,
+              enc.encode(body).byteLength,
+              nowIso(),
+            )
+            .run();
+        }
+      }
+      await env.DB.prepare("UPDATE job_files SET status = 'completed', detected_language = ?, updated_at = ? WHERE id = ?")
+        .bind(document.detected_language || null, nowIso(), fileId)
+        .run();
+      processed += 1;
+    } catch (error) {
+      failed += 1;
+      await env.DB.prepare("UPDATE job_files SET status = 'failed', error_json = ?, updated_at = ? WHERE id = ?")
+        .bind(JSON.stringify({ code: "file_processing_failed", message: String(error) }), nowIso(), fileId)
+        .run();
+    }
+  }
+
+  const artifactsRes = await env.DB.prepare("SELECT * FROM artifacts WHERE job_id = ?").bind(jobId).all<Record<string, unknown>>();
+  const zip = new JSZip();
+  zip.file(
+    "job_manifest.json",
+    JSON.stringify({ job_id: jobId, generated_at: nowIso(), processed_files: processed, failed_files: failed }, null, 2),
+  );
+  for (const artifact of artifactsRes.results || []) {
+    const object = await env.STORAGE.get(String(artifact.storage_path));
+    if (object) zip.file(String(artifact.name), await object.arrayBuffer());
+  }
+  const zipBuffer = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+  const bundlePath = `bundles/${jobId}.zip`;
+  await env.STORAGE.put(bundlePath, zipBuffer, { httpMetadata: { contentType: "application/zip" } });
+  await env.DB.prepare(
+    "INSERT INTO artifacts (id, job_id, file_id, format, variant, name, mime_type, kind, storage_path, size_bytes, created_at) VALUES (?, ?, NULL, 'zip', NULL, ?, 'application/zip', 'bundle', ?, ?, ?)",
+  )
+    .bind(uid(), jobId, `${jobId}.zip`, bundlePath, zipBuffer.byteLength, nowIso())
+    .run();
+
+  const status = processed === 0 && failed > 0 ? "failed" : "completed";
+  const errorJson = status === "failed" ? JSON.stringify({ code: "job_failed", message: "All files failed to process." }) : null;
+  await env.DB.prepare("UPDATE jobs SET status = ?, error_json = ?, result_json = ?, updated_at = ? WHERE id = ?")
+    .bind(status, errorJson, JSON.stringify({ processed_files: processed, failed_files: failed }), nowIso(), jobId)
+    .run();
+}
+
+app.get("/api/capabilities", (c) => c.json({ providers: PROVIDERS }));
+
+app.get("/api/settings/keys", async (c) => {
+  const rows = await c.env.DB.prepare("SELECT provider, updated_at FROM api_keys ORDER BY provider ASC").all<{ provider: string; updated_at: string }>();
+  const map = new Map((rows.results || []).map((row) => [row.provider, row.updated_at]));
+  return c.json(
+    PROVIDERS.map((p) => ({ provider: p.provider, configured: map.has(p.provider), updated_at: map.get(p.provider) || null })),
+  );
+});
+
+app.put("/api/settings/keys/:provider", async (c) => {
+  const provider = c.req.param("provider");
+  const body = await c.req.json<{ provider: string; key: string }>();
+  if (provider !== body.provider) return c.json({ error: "provider path/body mismatch" }, 400);
+  const encrypted = await encryptSecret(c.env.TM_ENCRYPTION_KEY, body.key);
+  await c.env.DB.prepare(
+    "INSERT INTO api_keys (provider, encrypted_key, updated_at) VALUES (?, ?, ?) ON CONFLICT(provider) DO UPDATE SET encrypted_key = excluded.encrypted_key, updated_at = excluded.updated_at",
+  )
+    .bind(provider, encrypted, nowIso())
+    .run();
+  return c.json({ provider, configured: true });
+});
+
+app.delete("/api/settings/keys/:provider", async (c) => {
+  const provider = c.req.param("provider");
+  await c.env.DB.prepare("DELETE FROM api_keys WHERE provider = ?").bind(provider).run();
+  return c.json({ provider, configured: false });
+});
+
+app.get("/api/settings/app", async (c) => {
+  const syncSize = Number((await getSetting(c.env, "sync_size_threshold_mb")) || c.env.SYNC_SIZE_THRESHOLD_MB || "20");
+  const retention = Number((await getSetting(c.env, "retention_days")) || c.env.RETENTION_DAYS || "7");
+  const fallback = ((await getSetting(c.env, "translation_fallback_order")) || c.env.TRANSLATION_FALLBACK_ORDER)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return c.json({
+    app_mode: "cloudflare",
+    sync_size_threshold_mb: syncSize,
+    retention_days: retention,
+    translation_fallback_order: fallback,
+    local_folder_allowlist: [],
+  });
+});
+
+app.put("/api/settings/app", async (c) => {
+  const body = await c.req.json<Record<string, unknown>>();
+  if (body.sync_size_threshold_mb != null) await setSetting(c.env, "sync_size_threshold_mb", String(body.sync_size_threshold_mb));
+  if (body.retention_days != null) await setSetting(c.env, "retention_days", String(body.retention_days));
+  if (body.translation_fallback_order != null) await setSetting(c.env, "translation_fallback_order", (body.translation_fallback_order as string[]).join(","));
+  return c.redirect("/api/settings/app", 307);
+});
+
+app.post("/api/jobs", async (c) => {
+  const form = await c.req.formData();
+  const provider = String(form.get("provider") || "") as ProviderName;
+  const model = String(form.get("model") || "");
+  const sourceLanguage = String(form.get("source_language") || "auto");
+  const targetLanguage = form.get("target_language") ? String(form.get("target_language")) : null;
+  const formats = String(form.get("formats") || "json,txt")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const files = form.getAll("files").filter((item): item is File => item instanceof File);
+  if (!files.length) return c.json({ error: "at least one file is required" }, 400);
+  if (!PROVIDERS.find((p) => p.provider === provider)) return c.json({ error: "unsupported provider" }, 400);
+
+  const jobId = uid();
+  const time = nowIso();
+  await c.env.DB.prepare(
+    "INSERT INTO jobs (id, status, provider, model, source_language, target_language, translation_enabled, options_json, created_at, updated_at) VALUES (?, 'queued', ?, ?, ?, ?, 1, ?, ?, ?)",
+  )
+    .bind(jobId, provider, model, sourceLanguage, targetLanguage, JSON.stringify({ formats }), time, time)
+    .run();
+
+  for (const file of files) {
+    const fileId = uid();
+    const storagePath = `uploads/${jobId}/${fileId}/${file.name}`;
+    await c.env.STORAGE.put(storagePath, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
+    await c.env.DB.prepare(
+      "INSERT INTO job_files (id, job_id, input_name, input_source, size_bytes, storage_path, status, created_at, updated_at) VALUES (?, ?, ?, 'upload', ?, ?, 'queued', ?, ?)",
+    )
+      .bind(fileId, jobId, file.name, file.size, storagePath, time, time)
+      .run();
+  }
+
+  await c.env.JOB_QUEUE.send({ jobId });
+  return c.json({ id: jobId, status: "queued" });
+});
+
+app.post("/api/jobs/from-folder", () => new Response(JSON.stringify({ error: "folder ingestion is local-only" }), { status: 400 }));
+
+app.get("/api/jobs", async (c) => {
+  const rows = await c.env.DB.prepare("SELECT id FROM jobs ORDER BY created_at DESC LIMIT 100").all<{ id: string }>();
+  const items: Record<string, unknown>[] = [];
+  for (const row of rows.results || []) {
+    const job = await c.env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(row.id).first<Record<string, unknown>>();
+    if (job) items.push(job);
+  }
+  return c.json(items);
+});
+
+app.get("/api/jobs/:jobId", async (c) => {
+  const jobId = c.req.param("jobId");
+  const job = await c.env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<Record<string, unknown>>();
+  if (!job) return c.json({ error: "job not found" }, 404);
+  const files = await c.env.DB.prepare("SELECT * FROM job_files WHERE job_id = ? ORDER BY created_at ASC").bind(jobId).all<Record<string, unknown>>();
+  const artifacts = await c.env.DB.prepare("SELECT * FROM artifacts WHERE job_id = ? ORDER BY created_at ASC").bind(jobId).all<Record<string, unknown>>();
+  return c.json({
+    ...job,
+    warning_json: parseJson(job.warning_json as string | null, null),
+    error_json: parseJson(job.error_json as string | null, null),
+    result_json: parseJson(job.result_json as string | null, null),
+    files: files.results || [],
+    artifacts: artifacts.results || [],
+  });
+});
+
+app.get("/api/jobs/:jobId/artifacts", async (c) => {
+  const artifacts = await c.env.DB.prepare("SELECT * FROM artifacts WHERE job_id = ? ORDER BY created_at ASC")
+    .bind(c.req.param("jobId"))
+    .all<Record<string, unknown>>();
+  return c.json(artifacts.results || []);
+});
+
+app.get("/api/jobs/:jobId/artifacts/:artifactId", async (c) => {
+  const artifact = await c.env.DB.prepare("SELECT * FROM artifacts WHERE id = ? AND job_id = ?")
+    .bind(c.req.param("artifactId"), c.req.param("jobId"))
+    .first<Record<string, unknown>>();
+  if (!artifact) return c.json({ error: "artifact not found" }, 404);
+  const object = await c.env.STORAGE.get(String(artifact.storage_path));
+  if (!object) return c.json({ error: "artifact object missing" }, 404);
+  return new Response(object.body, {
+    headers: {
+      "content-type": String(artifact.mime_type),
+      "content-disposition": `attachment; filename="${String(artifact.name)}"`,
+    },
+  });
+});
+
+app.get("/api/jobs/:jobId/bundle.zip", async (c) => {
+  const artifact = await c.env.DB.prepare("SELECT * FROM artifacts WHERE job_id = ? AND kind = 'bundle' ORDER BY created_at DESC LIMIT 1")
+    .bind(c.req.param("jobId"))
+    .first<Record<string, unknown>>();
+  if (!artifact) return c.json({ error: "bundle not found" }, 404);
+  const object = await c.env.STORAGE.get(String(artifact.storage_path));
+  if (!object) return c.json({ error: "bundle object missing" }, 404);
+  return new Response(object.body, {
+    headers: {
+      "content-type": "application/zip",
+      "content-disposition": `attachment; filename="${String(artifact.name)}"`,
+    },
+  });
+});
+
+app.post("/api/jobs/:jobId/cancel", async (c) => {
+  const jobId = c.req.param("jobId");
+  await c.env.DB.prepare("UPDATE jobs SET status = 'cancelled', updated_at = ? WHERE id = ?").bind(nowIso(), jobId).run();
+  await c.env.DB.prepare("UPDATE job_files SET status = 'cancelled', updated_at = ? WHERE job_id = ? AND status IN ('queued', 'running')")
+    .bind(nowIso(), jobId)
+    .run();
+  return c.json({ id: jobId, status: "cancelled" });
+});
+
+function page(title: string, content: string): string {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head><body style="font-family:Segoe UI,Tahoma,sans-serif;margin:24px;"><nav><a href="/jobs">Jobs</a> | <a href="/jobs/new">New Job</a> | <a href="/settings">Settings</a></nav>${content}</body></html>`;
+}
+
+app.get("/", (c) => c.redirect("/jobs"));
+app.get("/settings", () => new Response(page("Settings", "<h2>Settings</h2><p>Use /api/settings/* endpoints for cloud profile.</p>"), { headers: { "content-type": "text/html; charset=utf-8" } }));
+app.get("/jobs", () =>
+  new Response(
+    page(
+      "Jobs",
+      `<h2>Jobs</h2><pre id="jobs">Loading...</pre><script>fetch('/api/jobs').then(r=>r.json()).then(d=>document.getElementById('jobs').textContent=JSON.stringify(d,null,2));</script>`,
+    ),
+    { headers: { "content-type": "text/html; charset=utf-8" } },
+  ));
+app.get("/jobs/new", () =>
+  new Response(
+    page(
+      "New Job",
+      `<h2>Create Job</h2><form id="f"><label>Provider <select name="provider"><option value="openai">openai</option><option value="elevenlabs-scribe">elevenlabs-scribe</option><option value="deepgram">deepgram</option></select></label><br/><label>Model <input name="model" value="gpt-4o-mini-transcribe"/></label><br/><label>Formats <input name="formats" value="srt,vtt,html,txt,json"/></label><br/><input type="file" name="files" multiple/><br/><button type="submit">Submit</button></form><pre id="r"></pre><script>document.getElementById('f').addEventListener('submit',async(e)=>{e.preventDefault();const res=await fetch('/api/jobs',{method:'POST',body:new FormData(e.target)});document.getElementById('r').textContent=await res.text();});</script>`,
+    ),
+    { headers: { "content-type": "text/html; charset=utf-8" } },
+  ));
+
+export default {
+  fetch: app.fetch,
+  async queue(batch: MessageBatch<{ jobId: string }>, env: Env): Promise<void> {
+    for (const message of batch.messages) {
+      await processJob(env, message.body.jobId);
+      message.ack();
+    }
+  },
+  async scheduled(_: ScheduledEvent, env: Env): Promise<void> {
+    const days = Number((await getSetting(env, "retention_days")) || env.RETENTION_DAYS || "7");
+    const cutoff = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
+    const artifacts = await env.DB.prepare("SELECT storage_path FROM artifacts WHERE created_at < ?").bind(cutoff).all<{ storage_path: string }>();
+    for (const item of artifacts.results || []) {
+      await env.STORAGE.delete(item.storage_path);
+    }
+    await env.DB.prepare("DELETE FROM artifacts WHERE created_at < ?").bind(cutoff).run();
+    await env.DB.prepare("DELETE FROM job_files WHERE updated_at < ?").bind(cutoff).run();
+    await env.DB.prepare("DELETE FROM jobs WHERE updated_at < ?").bind(cutoff).run();
+  },
+};
