@@ -2,9 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from redis import Redis
-from rq import Queue
-
 from app.config import Settings
 
 
@@ -12,7 +9,12 @@ from app.config import Settings
 class QueueDispatcher:
     settings: Settings
 
-    def _queue(self) -> Queue:
+    def _queue(self):
+        try:
+            from redis import Redis  # type: ignore
+            from rq import Queue  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover - dependency availability
+            raise RuntimeError("Queue dependencies are not installed; install redis and rq.") from exc
         redis_conn = Redis.from_url(self.settings.redis_url)
         return Queue(name=self.settings.rq_queue_name, connection=redis_conn)
 

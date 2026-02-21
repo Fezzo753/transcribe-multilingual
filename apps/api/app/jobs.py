@@ -180,10 +180,13 @@ class JobService:
             )
 
         should_queue = self._should_queue(request, inputs)
-        if should_queue and self._queue_dispatcher:
-            try:
-                self._queue_dispatcher.enqueue_job(job_id)
-            except Exception:
+        if should_queue:
+            if self._queue_dispatcher:
+                try:
+                    self._queue_dispatcher.enqueue_job(job_id)
+                except Exception:
+                    should_queue = False
+            else:
                 should_queue = False
 
         if not should_queue:

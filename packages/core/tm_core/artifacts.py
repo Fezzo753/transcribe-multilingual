@@ -56,5 +56,5 @@ def create_zip_bundle(bundle_path: Path, files: list[tuple[str, Path]], manifest
     with ZipFile(bundle_path, "w", compression=ZIP_DEFLATED) as zf:
         zf.writestr("job_manifest.json", manifest)
         for arc_name, file_path in files:
-            zf.write(file_path, arc_name=arc_name)
+            zf.write(file_path, arcname=arc_name)
     return bundle_path

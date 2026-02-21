@@ -379,11 +379,16 @@ class Database:
 
     def delete_records_older_than(self, cutoff_iso: str) -> list[str]:
         with self._connect() as conn:
-            rows = conn.execute(
+            artifact_rows = conn.execute(
                 "SELECT storage_path FROM artifacts WHERE created_at < ?",
                 (cutoff_iso,),
             ).fetchall()
-            paths = [str(row["storage_path"]) for row in rows]
+            upload_rows = conn.execute(
+                "SELECT storage_path FROM job_files WHERE updated_at < ? AND input_source = 'upload'",
+                (cutoff_iso,),
+            ).fetchall()
+            paths = [str(row["storage_path"]) for row in artifact_rows]
+            paths.extend(str(row["storage_path"]) for row in upload_rows)
             conn.execute("DELETE FROM artifacts WHERE created_at < ?", (cutoff_iso,))
             conn.execute("DELETE FROM job_files WHERE updated_at < ?", (cutoff_iso,))
             conn.execute("DELETE FROM jobs WHERE updated_at < ?", (cutoff_iso,))
