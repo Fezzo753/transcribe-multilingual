@@ -1,3 +1,10 @@
 {
-    "chatgpt.openOnStartup": true
+    "chatgpt.openOnStartup": true,
+    "cSpell.words": [
+        "deepgram",
+        "elevenlabs",
+        "Segoe",
+        "Tahoma",
+        "WEBVTT"
+    ]
 }

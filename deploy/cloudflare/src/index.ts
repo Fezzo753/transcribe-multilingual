@@ -37,7 +37,9 @@ const PROVIDERS = [
   },
 ];
 
-const app = new Hono<{ Bindings: Env }>();
+const VALID_FORMATS: OutputFormat[] = ["srt", "vtt", "html", "txt", "json"];
+
+export const app = new Hono<{ Bindings: Env }>();
 app.use("/api/*", cors());
 
 const enc = new TextEncoder();
@@ -63,6 +65,35 @@ function parseJson<T>(raw: string | null, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+export function isSupportedProvider(value: string): value is ProviderName {
+  return PROVIDERS.some((provider) => provider.provider === value);
+}
+
+export function parseRequestedFormats(raw: string): OutputFormat[] {
+  const parsed = raw
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  if (parsed.length === 0) {
+    throw new Error("at least one output format is required");
+  }
+  for (const item of parsed) {
+    if (!VALID_FORMATS.includes(item as OutputFormat)) {
+      throw new Error(`unsupported output format '${item}'`);
+    }
+  }
+  return parsed as OutputFormat[];
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 async function getSetting(env: Env, key: string): Promise<string | null> {
@@ -94,7 +125,7 @@ async function importAesKey(secret: string): Promise<CryptoKey> {
   return crypto.subtle.importKey("raw", bytes, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
 }
 
-async function encryptSecret(secret: string, plaintext: string): Promise<string> {
+export async function encryptSecret(secret: string, plaintext: string): Promise<string> {
   const key = await importAesKey(secret);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(plaintext));
@@ -141,7 +172,9 @@ function render(document: TranscriptDocument, format: OutputFormat, variant: "so
     const rows = document.segments
       .map(
         (segment) =>
-          `<tr><td>${segment.id}</td><td>${segment.start.toFixed(2)}</td><td>${segment.end.toFixed(2)}</td><td>${segment.text}</td><td>${segment.translated_text ?? ""}</td></tr>`,
+          `<tr><td>${segment.id}</td><td>${segment.start.toFixed(2)}</td><td>${segment.end.toFixed(2)}</td><td>${escapeHtml(
+            segment.text,
+          )}</td><td>${escapeHtml(segment.translated_text ?? "")}</td></tr>`,
       )
       .join("");
     return `<!doctype html><html><body><table>${rows}</table></body></html>`;
@@ -154,9 +187,12 @@ function render(document: TranscriptDocument, format: OutputFormat, variant: "so
       .map((s, idx) => `${idx + 1}\n${tsSrt(s.start)} --> ${tsSrt(s.end)}\n${variant === "translated" ? s.translated_text || s.text : s.text}`)
       .join("\n\n")}\n`;
   }
-  return `WEBVTT\n\n${document.segments
-    .map((s) => `${tsVtt(s.start)} --> ${tsVtt(s.end)}\n${variant === "translated" ? s.translated_text || s.text : s.text}`)
-    .join("\n\n")}\n`;
+  if (format === "vtt") {
+    return `WEBVTT\n\n${document.segments
+      .map((s) => `${tsVtt(s.start)} --> ${tsVtt(s.end)}\n${variant === "translated" ? s.translated_text || s.text : s.text}`)
+      .join("\n\n")}\n`;
+  }
+  throw new Error(`unsupported output format '${format}'`);
 }
 
 async function transcribeOpenAI(apiKey: string, model: string, file: File, sourceLanguage: string): Promise<TranscriptDocument> {
@@ -184,8 +220,16 @@ async function transcribeOpenAI(apiKey: string, model: string, file: File, sourc
   return { provider: "openai", model, detected_language: (payload.language as string | undefined) || null, segments };
 }
 
-async function transcribeDeepgram(apiKey: string, model: string, file: File, sourceLanguage: string): Promise<TranscriptDocument> {
-  let url = `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(model)}&punctuate=true&smart_format=true`;
+async function transcribeDeepgram(
+  apiKey: string,
+  model: string,
+  file: File,
+  sourceLanguage: string,
+  diarizationEnabled: boolean,
+): Promise<TranscriptDocument> {
+  let url = `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(model)}&punctuate=true&smart_format=true&diarize=${
+    diarizationEnabled ? "true" : "false"
+  }`;
   if (sourceLanguage !== "auto") url += `&language=${encodeURIComponent(sourceLanguage)}`;
   const response = await fetch(url, {
     method: "POST",
@@ -208,11 +252,24 @@ async function transcribeDeepgram(apiKey: string, model: string, file: File, sou
   };
 }
 
-async function transcribeElevenlabs(apiKey: string, model: string, file: File, sourceLanguage: string): Promise<TranscriptDocument> {
+async function transcribeElevenlabs(
+  apiKey: string,
+  model: string,
+  file: File,
+  sourceLanguage: string,
+  diarizationEnabled: boolean,
+  speakerCount: number | null,
+): Promise<TranscriptDocument> {
   const form = new FormData();
   form.set("file", file, file.name);
   form.set("model_id", model);
   if (sourceLanguage !== "auto") form.set("language_code", sourceLanguage);
+  if (diarizationEnabled) {
+    form.set("diarize", "true");
+  }
+  if (speakerCount !== null) {
+    form.set("num_speakers", String(speakerCount));
+  }
   const response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
     method: "POST",
     headers: { "xi-api-key": apiKey },
@@ -228,15 +285,29 @@ async function transcribeElevenlabs(apiKey: string, model: string, file: File, s
   };
 }
 
-async function transcribe(env: Env, provider: ProviderName, model: string, file: File, sourceLanguage: string): Promise<TranscriptDocument> {
+async function transcribe(
+  env: Env,
+  provider: ProviderName,
+  model: string,
+  file: File,
+  sourceLanguage: string,
+  diarizationEnabled: boolean,
+  speakerCount: number | null,
+): Promise<TranscriptDocument> {
   const key = await getProviderKey(env, provider);
   if (!key) throw new Error(`missing API key for ${provider}`);
   if (provider === "openai") return transcribeOpenAI(key, model, file, sourceLanguage);
-  if (provider === "deepgram") return transcribeDeepgram(key, model, file, sourceLanguage);
-  return transcribeElevenlabs(key, model, file, sourceLanguage);
+  if (provider === "deepgram") return transcribeDeepgram(key, model, file, sourceLanguage, diarizationEnabled);
+  return transcribeElevenlabs(key, model, file, sourceLanguage, diarizationEnabled, speakerCount);
 }
 
-async function applyTranslation(env: Env, provider: ProviderName, document: TranscriptDocument, target: string, source: string | null): Promise<TranscriptDocument> {
+export async function applyTranslation(
+  env: Env,
+  provider: ProviderName,
+  document: TranscriptDocument,
+  target: string,
+  source: string | null,
+): Promise<TranscriptDocument> {
   const order = ((await getSetting(env, "translation_fallback_order")) || env.TRANSLATION_FALLBACK_ORDER)
     .split(",")
     .map((s) => s.trim())
@@ -264,9 +335,16 @@ async function applyTranslation(env: Env, provider: ProviderName, document: Tran
             }),
           });
           const payload = (await response.json()) as Record<string, unknown>;
+          if (!response.ok) {
+            throw new Error(`openai translation failed: ${JSON.stringify(payload)}`);
+          }
           const choices = (payload.choices as Array<Record<string, unknown>> | undefined) || [];
           const message = (choices[0]?.message as Record<string, unknown> | undefined) || {};
-          translated.push({ ...segment, translated_text: String(message.content || "").trim() });
+          const translatedText = String(message.content || "").trim();
+          if (!translatedText) {
+            throw new Error("openai translation returned empty text");
+          }
+          translated.push({ ...segment, translated_text: translatedText });
           continue;
         }
         if (backend === "deepgram" || (backend === "native" && provider === "deepgram")) {
@@ -276,7 +354,14 @@ async function applyTranslation(env: Env, provider: ProviderName, document: Tran
             body: JSON.stringify({ text: segment.text, target_language: target, source_language: source }),
           });
           const payload = (await response.json()) as Record<string, unknown>;
-          translated.push({ ...segment, translated_text: String(payload.translated_text || "") });
+          if (!response.ok) {
+            throw new Error(`deepgram translation failed: ${JSON.stringify(payload)}`);
+          }
+          const translatedText = String(payload.translated_text || "").trim();
+          if (!translatedText) {
+            throw new Error("deepgram translation returned empty text");
+          }
+          translated.push({ ...segment, translated_text: translatedText });
           continue;
         }
         translated.push({ ...segment, translated_text: segment.text });
@@ -289,24 +374,52 @@ async function applyTranslation(env: Env, provider: ProviderName, document: Tran
   return document;
 }
 
-async function processJob(env: Env, jobId: string): Promise<void> {
+export async function processJob(env: Env, jobId: string): Promise<void> {
   const job = await env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<Record<string, unknown>>();
   if (!job || ["completed", "failed", "cancelled"].includes(String(job.status))) return;
   await env.DB.prepare("UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ?").bind(nowIso(), jobId).run();
   const filesRes = await env.DB.prepare("SELECT * FROM job_files WHERE job_id = ? ORDER BY created_at ASC").bind(jobId).all<Record<string, unknown>>();
   const options = parseJson<Record<string, unknown>>(String(job.options_json || "{}"), {});
-  const formats = ((options.formats as string[] | undefined) || ["json", "txt"]) as OutputFormat[];
+  let formats: OutputFormat[];
+  try {
+    const rawFormats =
+      Array.isArray(options.formats) && options.formats.length > 0
+        ? options.formats.map((item) => String(item)).join(",")
+        : "json,txt";
+    formats = parseRequestedFormats(rawFormats);
+  } catch {
+    formats = ["json", "txt"];
+  }
+  const diarizationEnabled = Boolean(options.diarization_enabled ?? false);
+  const speakerCountRaw = options.speaker_count;
+  const parsedSpeakerCount =
+    speakerCountRaw == null || speakerCountRaw === "" ? null : Number(speakerCountRaw);
+  const speakerCount = typeof parsedSpeakerCount === "number" && Number.isFinite(parsedSpeakerCount) ? parsedSpeakerCount : null;
   let processed = 0;
   let failed = 0;
+  let cancelled = false;
 
   for (const row of filesRes.results || []) {
+    const current = await env.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(jobId).first<{ status: string }>();
+    if (!current || current.status === "cancelled") {
+      cancelled = true;
+      break;
+    }
     const fileId = String(row.id);
     await env.DB.prepare("UPDATE job_files SET status = 'running', updated_at = ? WHERE id = ?").bind(nowIso(), fileId).run();
     try {
       const object = await env.STORAGE.get(String(row.storage_path));
       if (!object) throw new Error("missing upload blob");
       const file = new File([await object.arrayBuffer()], String(row.input_name), { type: object.httpMetadata?.contentType });
-      let document = await transcribe(env, String(job.provider) as ProviderName, String(job.model), file, String(job.source_language));
+      let document = await transcribe(
+        env,
+        String(job.provider) as ProviderName,
+        String(job.model),
+        file,
+        String(job.source_language),
+        diarizationEnabled,
+        speakerCount,
+      );
       if (Number(job.translation_enabled) && job.target_language) {
         document = await applyTranslation(env, String(job.provider) as ProviderName, document, String(job.target_language), document.detected_language || null);
       }
@@ -352,6 +465,10 @@ async function processJob(env: Env, jobId: string): Promise<void> {
     }
   }
 
+  if (cancelled) {
+    return;
+  }
+
   const artifactsRes = await env.DB.prepare("SELECT * FROM artifacts WHERE job_id = ?").bind(jobId).all<Record<string, unknown>>();
   const zip = new JSZip();
   zip.file(
@@ -392,6 +509,7 @@ app.put("/api/settings/keys/:provider", async (c) => {
   const provider = c.req.param("provider");
   const body = await c.req.json<{ provider: string; key: string }>();
   if (provider !== body.provider) return c.json({ error: "provider path/body mismatch" }, 400);
+  if (!isSupportedProvider(provider)) return c.json({ error: `unsupported provider '${provider}'` }, 400);
   const encrypted = await encryptSecret(c.env.TM_ENCRYPTION_KEY, body.key);
   await c.env.DB.prepare(
     "INSERT INTO api_keys (provider, encrypted_key, updated_at) VALUES (?, ?, ?) ON CONFLICT(provider) DO UPDATE SET encrypted_key = excluded.encrypted_key, updated_at = excluded.updated_at",
@@ -403,6 +521,7 @@ app.put("/api/settings/keys/:provider", async (c) => {
 
 app.delete("/api/settings/keys/:provider", async (c) => {
   const provider = c.req.param("provider");
+  if (!isSupportedProvider(provider)) return c.json({ error: `unsupported provider '${provider}'` }, 400);
   await c.env.DB.prepare("DELETE FROM api_keys WHERE provider = ?").bind(provider).run();
   return c.json({ provider, configured: false });
 });
@@ -428,7 +547,19 @@ app.put("/api/settings/app", async (c) => {
   if (body.sync_size_threshold_mb != null) await setSetting(c.env, "sync_size_threshold_mb", String(body.sync_size_threshold_mb));
   if (body.retention_days != null) await setSetting(c.env, "retention_days", String(body.retention_days));
   if (body.translation_fallback_order != null) await setSetting(c.env, "translation_fallback_order", (body.translation_fallback_order as string[]).join(","));
-  return c.redirect("/api/settings/app", 307);
+  const syncSize = Number((await getSetting(c.env, "sync_size_threshold_mb")) || c.env.SYNC_SIZE_THRESHOLD_MB || "20");
+  const retention = Number((await getSetting(c.env, "retention_days")) || c.env.RETENTION_DAYS || "7");
+  const fallback = ((await getSetting(c.env, "translation_fallback_order")) || c.env.TRANSLATION_FALLBACK_ORDER)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return c.json({
+    app_mode: "cloudflare",
+    sync_size_threshold_mb: syncSize,
+    retention_days: retention,
+    translation_fallback_order: fallback,
+    local_folder_allowlist: [],
+  });
 });
 
 app.post("/api/jobs", async (c) => {
@@ -437,20 +568,47 @@ app.post("/api/jobs", async (c) => {
   const model = String(form.get("model") || "");
   const sourceLanguage = String(form.get("source_language") || "auto");
   const targetLanguage = form.get("target_language") ? String(form.get("target_language")) : null;
-  const formats = String(form.get("formats") || "json,txt")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const translationEnabled = String(form.get("translation_enabled") || "true") !== "false";
+  const diarizationEnabled = String(form.get("diarization_enabled") || "false") === "true";
+  const syncPreferred = String(form.get("sync_preferred") || "true") !== "false";
+  const speakerCountRaw = String(form.get("speaker_count") || "").trim();
+  const speakerCount = speakerCountRaw ? Number(speakerCountRaw) : null;
+  const batchLabel = form.get("batch_label") ? String(form.get("batch_label")) : null;
+  let formats: OutputFormat[];
+  try {
+    formats = parseRequestedFormats(String(form.get("formats") || "json,txt"));
+  } catch (error) {
+    return c.json({ error: String(error instanceof Error ? error.message : error) }, 400);
+  }
+  if (speakerCount !== null && !Number.isFinite(speakerCount)) {
+    return c.json({ error: "speaker_count must be a valid number" }, 400);
+  }
   const files = form.getAll("files").filter((item): item is File => item instanceof File);
   if (!files.length) return c.json({ error: "at least one file is required" }, 400);
-  if (!PROVIDERS.find((p) => p.provider === provider)) return c.json({ error: "unsupported provider" }, 400);
+  if (!isSupportedProvider(provider)) return c.json({ error: "unsupported provider" }, 400);
 
   const jobId = uid();
   const time = nowIso();
   await c.env.DB.prepare(
-    "INSERT INTO jobs (id, status, provider, model, source_language, target_language, translation_enabled, options_json, created_at, updated_at) VALUES (?, 'queued', ?, ?, ?, ?, 1, ?, ?, ?)",
+    "INSERT INTO jobs (id, status, provider, model, source_language, target_language, translation_enabled, options_json, created_at, updated_at) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)",
   )
-    .bind(jobId, provider, model, sourceLanguage, targetLanguage, JSON.stringify({ formats }), time, time)
+    .bind(
+      jobId,
+      provider,
+      model,
+      sourceLanguage,
+      targetLanguage,
+      translationEnabled ? 1 : 0,
+      JSON.stringify({
+        formats,
+        diarization_enabled: diarizationEnabled,
+        speaker_count: speakerCount,
+        sync_preferred: syncPreferred,
+        batch_label: batchLabel,
+      }),
+      time,
+      time,
+    )
     .run();
 
   for (const file of files) {
@@ -471,13 +629,16 @@ app.post("/api/jobs", async (c) => {
 app.post("/api/jobs/from-folder", () => new Response(JSON.stringify({ error: "folder ingestion is local-only" }), { status: 400 }));
 
 app.get("/api/jobs", async (c) => {
-  const rows = await c.env.DB.prepare("SELECT id FROM jobs ORDER BY created_at DESC LIMIT 100").all<{ id: string }>();
-  const items: Record<string, unknown>[] = [];
-  for (const row of rows.results || []) {
-    const job = await c.env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(row.id).first<Record<string, unknown>>();
-    if (job) items.push(job);
-  }
-  return c.json(items);
+  const rows = await c.env.DB.prepare("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 100").all<Record<string, unknown>>();
+  return c.json(
+    (rows.results || []).map((job) => ({
+      ...job,
+      warning_json: parseJson(job.warning_json as string | null, null),
+      error_json: parseJson(job.error_json as string | null, null),
+      result_json: parseJson(job.result_json as string | null, null),
+      options_json: parseJson(job.options_json as string | null, null),
+    })),
+  );
 });
 
 app.get("/api/jobs/:jobId", async (c) => {
@@ -565,6 +726,28 @@ app.get("/jobs/new", () =>
     { headers: { "content-type": "text/html; charset=utf-8" } },
   ));
 
+export async function cleanupExpiredData(env: Env): Promise<void> {
+  const days = Number((await getSetting(env, "retention_days")) || env.RETENTION_DAYS || "7");
+  const cutoff = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
+
+  const artifactRows = await env.DB.prepare("SELECT storage_path FROM artifacts WHERE created_at < ?").bind(cutoff).all<{ storage_path: string }>();
+  const uploadRows = await env.DB.prepare("SELECT storage_path FROM job_files WHERE updated_at < ?").bind(cutoff).all<{ storage_path: string }>();
+  const allPaths = new Set<string>();
+  for (const item of artifactRows.results || []) {
+    allPaths.add(item.storage_path);
+  }
+  for (const item of uploadRows.results || []) {
+    allPaths.add(item.storage_path);
+  }
+  for (const path of allPaths) {
+    await env.STORAGE.delete(path);
+  }
+
+  await env.DB.prepare("DELETE FROM artifacts WHERE created_at < ?").bind(cutoff).run();
+  await env.DB.prepare("DELETE FROM job_files WHERE updated_at < ?").bind(cutoff).run();
+  await env.DB.prepare("DELETE FROM jobs WHERE updated_at < ?").bind(cutoff).run();
+}
+
 export default {
   fetch: app.fetch,
   async queue(batch: MessageBatch<{ jobId: string }>, env: Env): Promise<void> {
@@ -574,14 +757,6 @@ export default {
     }
   },
   async scheduled(_: ScheduledEvent, env: Env): Promise<void> {
-    const days = Number((await getSetting(env, "retention_days")) || env.RETENTION_DAYS || "7");
-    const cutoff = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
-    const artifacts = await env.DB.prepare("SELECT storage_path FROM artifacts WHERE created_at < ?").bind(cutoff).all<{ storage_path: string }>();
-    for (const item of artifacts.results || []) {
-      await env.STORAGE.delete(item.storage_path);
-    }
-    await env.DB.prepare("DELETE FROM artifacts WHERE created_at < ?").bind(cutoff).run();
-    await env.DB.prepare("DELETE FROM job_files WHERE updated_at < ?").bind(cutoff).run();
-    await env.DB.prepare("DELETE FROM jobs WHERE updated_at < ?").bind(cutoff).run();
+    await cleanupExpiredData(env);
   },
 };
