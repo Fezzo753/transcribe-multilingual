@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Jobs | Transcribe Multilingual{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="actions" style="justify-content: space-between;">
+    <h2 style="margin: 0;">Jobs</h2>
+    <a href="/jobs/new"><button style="width: auto;">Create Job</button></a>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Job ID</th>
+        <th>Status</th>
+        <th>Provider/Model</th>
+        <th>Files</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for job in jobs %}
+      <tr>
+        <td><a href="/jobs/{{ job.id }}">{{ job.id }}</a></td>
+        <td>
+          {% if job.status == "completed" %}
+          <span class="pill ok">{{ job.status }}</span>
+          {% elif job.status == "failed" %}
+          <span class="pill fail">{{ job.status }}</span>
+          {% else %}
+          <span class="pill">{{ job.status }}</span>
+          {% endif %}
+        </td>
+        <td>{{ job.provider }} / {{ job.model }}</td>
+        <td>{{ job.files | length }}</td>
+        <td>{{ job.updated_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

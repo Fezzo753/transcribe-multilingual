@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Settings | Transcribe Multilingual{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Runtime Settings</h2>
+  <p class="muted">Mode: <strong>{{ app_mode }}</strong></p>
+  <div class="grid two">
+    <div>
+      <label for="sync_size_threshold_mb">Sync Size Threshold (MB)</label>
+      <input id="sync_size_threshold_mb" type="number" value="{{ sync_size_threshold_mb }}" />
+    </div>
+    <div>
+      <label for="retention_days">Retention Days</label>
+      <input id="retention_days" type="number" value="{{ retention_days }}" />
+    </div>
+    <div>
+      <label for="fallback_order">Fallback Order (comma separated)</label>
+      <input id="fallback_order" type="text" value="{{ fallback_order | join(',') }}" />
+    </div>
+    <div>
+      <label for="allowlist">Local Folder Allowlist (comma separated)</label>
+      <input id="allowlist" type="text" value="{{ allowlist }}" />
+    </div>
+  </div>
+  <div class="actions" style="margin-top: 12px;">
+    <button id="save-app-settings">Save Settings</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Provider API Keys</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Provider</th>
+        <th>Configured</th>
+        <th>Key Input</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for provider in providers %}
+      <tr>
+        <td>{{ provider.provider }}</td>
+        <td>
+          {% if keys.get(provider.provider) %}
+          <span class="pill ok">Configured</span>
+          {% else %}
+          <span class="pill">Missing</span>
+          {% endif %}
+        </td>
+        <td><input id="key-{{ provider.provider }}" type="password" placeholder="Paste API key" /></td>
+        <td class="actions">
+          <button onclick="saveKey('{{ provider.provider }}')" {% if not provider.requires_api_key %}disabled{% endif %}>Save</button>
+          <button class="danger" onclick="deleteKey('{{ provider.provider }}')" {% if not provider.requires_api_key %}disabled{% endif %}>Delete</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<script>
+async function saveKey(provider) {
+  const value = document.getElementById(`key-${provider}`).value;
+  if (!value) {
+    alert("Enter a key first.");
+    return;
+  }
+  const res = await fetch(`/api/settings/keys/${provider}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider, key: value }),
+  });
+  if (!res.ok) {
+    alert(await res.text());
+    return;
+  }
+  location.reload();
+}
+
+async function deleteKey(provider) {
+  const res = await fetch(`/api/settings/keys/${provider}`, { method: "DELETE" });
+  if (!res.ok) {
+    alert(await res.text());
+    return;
+  }
+  location.reload();
+}
+
+document.getElementById("save-app-settings").addEventListener("click", async () => {
+  const payload = {
+    sync_size_threshold_mb: Number(document.getElementById("sync_size_threshold_mb").value),
+    retention_days: Number(document.getElementById("retention_days").value),
+    translation_fallback_order: document.getElementById("fallback_order").value.split(",").map(x => x.trim()).filter(Boolean),
+    local_folder_allowlist: document.getElementById("allowlist").value.split(",").map(x => x.trim()).filter(Boolean),
+  };
+  const res = await fetch("/api/settings/app", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    alert(await res.text());
+    return;
+  }
+  alert("Saved.");
+});
+</script>
+{% endblock %}

@@ -1,0 +1,151 @@
+{% extends "base.html" %}
+{% block title %}New Job | Transcribe Multilingual{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Create Batch Job</h2>
+  <div class="grid two">
+    <div>
+      <label for="provider">Provider</label>
+      <select id="provider"></select>
+    </div>
+    <div>
+      <label for="model">Model</label>
+      <select id="model"></select>
+    </div>
+    <div>
+      <label for="source_language">Source Language</label>
+      <input id="source_language" value="auto" />
+    </div>
+    <div>
+      <label for="target_language">Target Language</label>
+      <input id="target_language" placeholder="Optional, e.g. fr" />
+    </div>
+    <div>
+      <label for="formats">Formats (comma separated)</label>
+      <input id="formats" value="srt,vtt,html,txt,json" />
+    </div>
+    <div>
+      <label for="batch_label">Batch Label</label>
+      <input id="batch_label" placeholder="Optional" />
+    </div>
+    <div>
+      <label for="diarization_enabled">Diarization</label>
+      <select id="diarization_enabled">
+        <option value="false" selected>Disabled</option>
+        <option value="true">Enabled</option>
+      </select>
+    </div>
+    <div>
+      <label for="speaker_count">Speaker Count</label>
+      <input id="speaker_count" type="number" placeholder="Optional" />
+    </div>
+  </div>
+
+  <h3>Upload Files</h3>
+  <input id="files" type="file" multiple />
+  <div class="actions" style="margin-top: 12px;">
+    <button id="submit-upload">Submit Upload Job</button>
+  </div>
+
+  {% if app_mode == "local" %}
+  <h3>Local Folder Batch</h3>
+  <input id="folder_path" type="text" placeholder="C:\path\to\media" />
+  <div class="actions" style="margin-top: 12px;">
+    <button class="secondary" id="submit-folder">Submit Folder Job</button>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+const capabilities = {{ capabilities | tojson }};
+const providerSelect = document.getElementById("provider");
+const modelSelect = document.getElementById("model");
+
+for (const provider of capabilities.providers) {
+  const option = document.createElement("option");
+  option.value = provider.provider;
+  option.textContent = provider.provider;
+  providerSelect.appendChild(option);
+}
+
+function syncModels() {
+  const selectedProvider = providerSelect.value;
+  const provider = capabilities.providers.find((item) => item.provider === selectedProvider);
+  modelSelect.innerHTML = "";
+  for (const model of provider.models) {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.id;
+    modelSelect.appendChild(option);
+  }
+}
+providerSelect.addEventListener("change", syncModels);
+syncModels();
+
+function basePayload() {
+  return {
+    provider: providerSelect.value,
+    model: modelSelect.value,
+    source_language: document.getElementById("source_language").value || "auto",
+    target_language: document.getElementById("target_language").value || null,
+    formats: document.getElementById("formats").value,
+    diarization_enabled: document.getElementById("diarization_enabled").value === "true",
+    speaker_count: document.getElementById("speaker_count").value || "",
+    translation_enabled: true,
+    sync_preferred: true,
+    batch_label: document.getElementById("batch_label").value || "",
+  };
+}
+
+document.getElementById("submit-upload").addEventListener("click", async () => {
+  const filesInput = document.getElementById("files");
+  if (!filesInput.files.length) {
+    alert("Select one or more files.");
+    return;
+  }
+  const payload = basePayload();
+  const form = new FormData();
+  for (const file of filesInput.files) {
+    form.append("files", file);
+  }
+  for (const [k, v] of Object.entries(payload)) {
+    if (v !== null && v !== undefined) {
+      form.append(k, String(v));
+    }
+  }
+  const res = await fetch("/api/jobs", { method: "POST", body: form });
+  if (!res.ok) {
+    alert(await res.text());
+    return;
+  }
+  const job = await res.json();
+  location.href = `/jobs/${job.id}`;
+});
+
+const folderButton = document.getElementById("submit-folder");
+if (folderButton) {
+  folderButton.addEventListener("click", async () => {
+    const folderPath = document.getElementById("folder_path").value;
+    if (!folderPath) {
+      alert("Enter a folder path.");
+      return;
+    }
+    const payload = basePayload();
+    payload.formats = payload.formats.split(",").map((x) => x.trim()).filter(Boolean);
+    payload.folder_path = folderPath;
+    payload.files_count = 1;
+    const res = await fetch("/api/jobs/from-folder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      alert(await res.text());
+      return;
+    }
+    const job = await res.json();
+    location.href = `/jobs/${job.id}`;
+  });
+}
+</script>
+{% endblock %}
