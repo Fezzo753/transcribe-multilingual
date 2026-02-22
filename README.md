@@ -1,99 +1,153 @@
 # Transcribe Multilingual
 
-Multilingual transcription + translation platform with dual runtime profiles:
+Multilingual transcription + translation app with two runtime profiles:
 
-- Local profile: FastAPI + server-rendered UI + SQLite + Redis/RQ + local filesystem storage
-- Cloudflare profile: Worker (Hono) + D1 + R2 + Queues + Cron cleanup
+- Local profile: FastAPI API + server-rendered UI + SQLite + Redis/RQ + local filesystem artifacts.
+- Cloudflare profile: TypeScript Worker (Hono) + D1 + R2 + Queues + Cron cleanup.
 
-## Plan Status
+## What Is Implemented
 
-The implementation plan is completed in this repo:
+- Provider adapters: `whisper-local` (local only), `openai`, `elevenlabs-scribe`, `deepgram`.
+- Provider-model compatible selection in UI.
+- Multi-file batch upload jobs in local and cloud profiles.
+- Local folder ingestion (`/api/jobs/from-folder`) in local profile only.
+- Optional translation with fallback order: `native -> openai -> deepgram`.
+- Job options: diarization, speaker count, timestamp level (`segment` or `word`), translation on/off, target language, verbose output, sync preference.
+- Output formats: `srt`, `vtt`, `html`, `txt`, `json`.
+- Source and translated artifact variants where applicable.
+- Flat ZIP export with prefixed filenames and `job_manifest.json`.
+- Polling-based status updates.
+- Encrypted API key persistence at rest.
+- Retention cleanup (default 7 days).
 
-- Shared core contracts/utilities: done (`packages/core/tm_core`)
-- Local API/UI/worker pipeline: done (`apps/api`, `apps/worker`)
-- Cloudflare Worker API/UI/queue pipeline: done (`deploy/cloudflare`)
-- Provider adapters and fallback translation orchestration: done
-- Source/translated artifact generation + ZIP bundles: done
-- Encrypted API key persistence (local file key / cloud secret key): done
-- Retention cleanup jobs (local periodic + cloud cron): done
-- Test coverage for unit, integration, and e2e flows: done
+## Provider and Model Support
 
-## Supported Providers
-
-- `whisper-local` (local profile only)
-- `openai`
-- `elevenlabs-scribe` (`scribe_v1`, `scribe_v2`)
-- `deepgram`
-
-## Core Features
-
-- Multi-file batch jobs
-- Optional translation to target language
-- Fallback order: `native -> openai -> deepgram` (configurable)
-- Output formats: `srt`, `vtt`, `html`, `txt`, `json`
-- Source + translated variants for subtitle/text outputs
-- Combined HTML + JSON transcript outputs
-- Flat ZIP bundle naming with manifest (`job_manifest.json`)
-- Polling-based progress/status APIs
-- 7-day retention cleanup (default)
+- `whisper-local`: `tiny`, `small`, `medium` (disabled in cloud profile).
+- `openai`: `gpt-4o-mini-transcribe`, `whisper-1`.
+- `elevenlabs-scribe`: `scribe_v1`, `scribe_v2`.
+- `deepgram`: `nova-3`.
 
 ## Repository Layout
 
-- `apps/api`: FastAPI backend + server-rendered UI
-- `apps/worker`: RQ worker tasks
-- `packages/core/tm_core`: shared schemas, formatters, adapters, capabilities, translation, artifacts
-- `deploy/cloudflare`: Worker runtime, schema, config, tests
-- `deploy/local`: local deployment notes
-- `tests/unit`, `tests/integration`, `tests/e2e`: Python test suites
+- `apps/api`: local FastAPI API and server-rendered UI.
+- `apps/worker`: RQ worker entrypoints and background tasks.
+- `packages/core/tm_core`: shared schemas, capabilities, adapters, formatters, translation, artifact utilities.
+- `deploy/cloudflare`: Worker source, schema, Wrangler config, tests.
+- `deploy/local`: local deployment notes.
+- `tests`: unit, integration, and e2e tests for the Python/local profile.
 
-## Local Setup
+## Local Profile Quickstart
 
-1. Install dependencies:
+Prerequisites:
+
+- Python 3.12+
+- Redis
+
+Install:
 
 ```bash
-pip install -e ".[dev,local-whisper]"
+pip install -e ".[dev]"
 ```
 
-2. Run Redis:
+Install local Whisper support:
+
+```bash
+pip install -e ".[local-whisper]"
+```
+
+Start Redis:
 
 ```bash
 docker run --rm -p 6379:6379 redis:7-alpine
 ```
 
-3. Start API:
+Run API:
 
 ```bash
 uvicorn app.main:app --reload --app-dir apps/api
 ```
 
-4. Start worker:
+Run worker:
 
 ```bash
 python -m apps.worker.run_worker
 ```
 
-5. Open UI:
+Open UI:
 
 - `http://localhost:8000/jobs`
 - `http://localhost:8000/jobs/new`
 - `http://localhost:8000/settings`
 
-## Cloudflare Setup
+## Local Profile Environment Variables (`TM_*`)
 
-See `deploy/cloudflare/README.md`.
+- `TM_APP_MODE`: defaults to `local`.
+- `TM_DB_PATH`: defaults to `data/app.db`.
+- `TM_STORAGE_DIR`: defaults to `data/storage`.
+- `TM_TEMP_DIR`: defaults to `data/temp`.
+- `TM_KEY_FILE_PATH`: defaults to `~/.transcribe-multilingual/secret.key`.
+- `TM_REDIS_URL`: defaults to `redis://localhost:6379/0`.
+- `TM_RQ_QUEUE_NAME`: defaults to `transcribe`.
+- `TM_SYNC_SIZE_THRESHOLD_MB`: defaults to `20`.
+- `TM_RETENTION_DAYS`: defaults to `7`.
+- `TM_CLEANUP_INTERVAL_MINUTES`: defaults to `60`.
+- `TM_TRANSLATION_FALLBACK_ORDER`: defaults to `native,openai,deepgram`.
+- `TM_LOCAL_FOLDER_ALLOWLIST`: comma-separated allowed roots for `/api/jobs/from-folder`.
+- `TM_OPENAI_TRANSLATION_MODEL`: defaults to `gpt-4o-mini`.
+- `TM_CORS_ORIGINS`: defaults to `*`.
 
-Key files:
+## Cloudflare Profile Deployment
 
-- Worker app: `deploy/cloudflare/src/index.ts`
-- D1 schema: `deploy/cloudflare/schema.sql`
-- Wrangler config: `deploy/cloudflare/wrangler.toml`
+From `deploy/cloudflare`:
 
-Cloud mode intentionally disables:
+```bash
+npm install
+```
 
-- `whisper-local`
-- `/api/jobs/from-folder`
+Create resources in Cloudflare:
+
+- D1 database
+- R2 bucket
+- Queue
+
+Apply schema:
+
+```bash
+wrangler d1 execute transcribe-multilingual --file=./schema.sql
+```
+
+Update `deploy/cloudflare/wrangler.toml` bindings and IDs:
+
+- `[[d1_databases]]` for `DB`
+- `[[r2_buckets]]` for `STORAGE`
+- `[[queues.producers]]` and `[[queues.consumers]]` for `JOB_QUEUE`
+
+Set encryption key secret:
+
+```bash
+wrangler secret put TM_ENCRYPTION_KEY
+```
+
+Run locally:
+
+```bash
+npm run dev
+```
+
+Deploy:
+
+```bash
+npm run deploy
+```
+
+Cloud profile behavior:
+
+- `whisper-local` is disabled.
+- `/api/jobs/from-folder` returns an error (local-only feature).
 
 ## API Surface
+
+Common:
 
 - `GET /api/capabilities`
 - `GET /api/settings/keys`
@@ -102,7 +156,6 @@ Cloud mode intentionally disables:
 - `GET /api/settings/app`
 - `PUT /api/settings/app`
 - `POST /api/jobs`
-- `POST /api/jobs/from-folder` (local only)
 - `GET /api/jobs`
 - `GET /api/jobs/{job_id}`
 - `GET /api/jobs/{job_id}/artifacts`
@@ -110,36 +163,54 @@ Cloud mode intentionally disables:
 - `GET /api/jobs/{job_id}/bundle.zip`
 - `POST /api/jobs/{job_id}/cancel`
 
-## Security and Key Storage
+Local only:
 
-- Local mode:
-  - Generates/uses a local Fernet key file (`TM_KEY_FILE_PATH`)
-  - Stores encrypted provider API keys in SQLite
-- Cloud mode:
-  - Requires `TM_ENCRYPTION_KEY` secret
-  - Stores encrypted provider API keys in D1
+- `POST /api/jobs/from-folder`
 
-## Artifact Naming
+## Job Options and Output Behavior
 
-Per file prefix (`{safe_input_prefix}`):
+Job options accepted by API/UI:
+
+- `provider`, `model`
+- `source_language`, `target_language`
+- `translation_enabled`
+- `diarization_enabled`, `speaker_count`
+- `timestamp_level` (`segment` or `word`)
+- `verbose_output`
+- `sync_preferred`
+- `formats`
+
+Format handling:
+
+- `srt`, `vtt`, `txt`: source artifact plus translated artifact when translated text exists.
+- `html`: combined side-by-side output.
+- `json`: combined output with transcript metadata and translated text fields when available.
+
+Artifact naming per input prefix:
 
 - `{prefix}__source.srt`
-- `{prefix}__translated.srt` (when translation is available)
+- `{prefix}__translated.srt`
 - `{prefix}__source.vtt`
-- `{prefix}__translated.vtt` (when translation is available)
+- `{prefix}__translated.vtt`
 - `{prefix}__source.txt`
-- `{prefix}__translated.txt` (when translation is available)
+- `{prefix}__translated.txt`
 - `{prefix}__combined.html`
 - `{prefix}__transcript.json`
 
 Bundle output:
 
-- `{job_id}.zip`
-- contains all generated artifacts + `job_manifest.json`
+- `{job_id}.zip` with artifacts and `job_manifest.json`.
+
+## Security Model
+
+- Single-user deployment assumption.
+- API keys are encrypted at rest in DB.
+- Local profile auto-generates a key file if missing.
+- Cloudflare profile requires `TM_ENCRYPTION_KEY` secret.
 
 ## Testing
 
-Python tests:
+Python/local tests:
 
 ```bash
 pytest -q
@@ -150,8 +221,3 @@ Cloudflare tests:
 ```bash
 npm --prefix deploy/cloudflare test
 ```
-
-Current expected status:
-
-- Python: `20 passed`
-- Cloudflare Vitest: `5 passed`

@@ -379,6 +379,20 @@ describe("cloudflare worker fixes", () => {
     expect(payload.retention_days).toBe(10);
   });
 
+  it("renders settings page with provider API key controls", async () => {
+    const env = createEnv();
+    const response = await app.request("http://worker.local/settings", { method: "GET" }, env as never);
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain("Provider API keys are encrypted at rest");
+    expect(html).toContain('data-provider="openai"');
+    expect(html).toContain('data-provider="elevenlabs-scribe"');
+    expect(html).toContain('data-provider="deepgram"');
+    expect(html).toContain('class="save-key"');
+    expect(html).toContain('class="delete-key"');
+    expect(html).toContain("/api/settings/keys");
+  });
+
   it("translation fallback continues to deepgram when openai fails", async () => {
     const env = createEnv();
     env.DB.settings.set("translation_fallback_order", "openai,deepgram");

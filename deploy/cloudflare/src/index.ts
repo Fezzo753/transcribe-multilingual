@@ -819,7 +819,114 @@ function page(title: string, content: string): string {
 }
 
 app.get("/", (c) => c.redirect("/jobs"));
-app.get("/settings", () => new Response(page("Settings", "<h2>Settings</h2><p>Use /api/settings/* endpoints for cloud profile.</p>"), { headers: { "content-type": "text/html; charset=utf-8" } }));
+app.get("/settings", () => {
+  const providerRows = PROVIDERS.map(
+    (provider) =>
+      `<tr data-provider="${provider.provider}"><td><code>${provider.provider}</code></td><td>${provider.models.join(
+        ", ",
+      )}</td><td class="key-status">loading...</td><td><input class="key-input" type="password" autocomplete="off" placeholder="Paste API key" style="width:100%;"/></td><td><button type="button" class="save-key">Save</button> <button type="button" class="delete-key">Delete</button></td></tr>`,
+  ).join("");
+  return new Response(
+    page(
+      "Settings",
+      `<h2>Settings</h2>
+      <p>Provider API keys are encrypted at rest. Paste a key and click Save to store it for this deployment.</p>
+      <div style="overflow:auto;max-width:1100px;">
+        <table style="border-collapse:collapse;width:100%;">
+          <thead>
+            <tr>
+              <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">Provider</th>
+              <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">Models</th>
+              <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">Status</th>
+              <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">API Key</th>
+              <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">Actions</th>
+            </tr>
+          </thead>
+          <tbody>${providerRows}</tbody>
+        </table>
+      </div>
+      <pre id="settings-result" style="margin-top:12px;"></pre>
+      <script>
+        const rows = Array.from(document.querySelectorAll('tr[data-provider]'));
+        const statusBox = document.getElementById('settings-result');
+
+        function setStatus(message, isError) {
+          statusBox.textContent = message;
+          statusBox.style.color = isError ? '#b91c1c' : '#166534';
+        }
+
+        async function refreshKeys() {
+          const response = await fetch('/api/settings/keys');
+          if (!response.ok) {
+            setStatus(await response.text(), true);
+            return;
+          }
+          const payload = await response.json();
+          const byProvider = {};
+          for (const item of payload) {
+            byProvider[item.provider] = item;
+          }
+          for (const row of rows) {
+            const provider = row.getAttribute('data-provider');
+            const statusCell = row.querySelector('.key-status');
+            const info = byProvider[provider];
+            if (info && info.configured) {
+              const updated = info.updated_at ? ' (' + info.updated_at + ')' : '';
+              statusCell.textContent = 'configured' + updated;
+              statusCell.style.color = '#166534';
+            } else {
+              statusCell.textContent = 'not configured';
+              statusCell.style.color = '#b91c1c';
+            }
+          }
+        }
+
+        async function saveKey(row) {
+          const provider = row.getAttribute('data-provider');
+          const input = row.querySelector('.key-input');
+          const key = (input.value || '').trim();
+          if (!key) {
+            setStatus('API key is required for ' + provider, true);
+            return;
+          }
+          const response = await fetch('/api/settings/keys/' + encodeURIComponent(provider), {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ provider, key }),
+          });
+          if (!response.ok) {
+            setStatus(await response.text(), true);
+            return;
+          }
+          input.value = '';
+          setStatus('Saved key for ' + provider, false);
+          await refreshKeys();
+        }
+
+        async function deleteKey(row) {
+          const provider = row.getAttribute('data-provider');
+          const response = await fetch('/api/settings/keys/' + encodeURIComponent(provider), { method: 'DELETE' });
+          if (!response.ok) {
+            setStatus(await response.text(), true);
+            return;
+          }
+          const input = row.querySelector('.key-input');
+          input.value = '';
+          setStatus('Deleted key for ' + provider, false);
+          await refreshKeys();
+        }
+
+        for (const row of rows) {
+          row.querySelector('.save-key').addEventListener('click', () => saveKey(row));
+          row.querySelector('.delete-key').addEventListener('click', () => deleteKey(row));
+        }
+
+        refreshKeys();
+      </script>`,
+    ),
+    { headers: { "content-type": "text/html; charset=utf-8" } },
+  );
+});
 app.get("/jobs", () =>
   new Response(
     page(
