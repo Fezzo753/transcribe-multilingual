@@ -17,16 +17,26 @@
       <input id="source_language" value="auto" />
     </div>
     <div>
-      <label for="target_language">Target Language</label>
-      <input id="target_language" placeholder="Optional, e.g. fr" />
-    </div>
-    <div>
-      <label for="formats">Formats (comma separated)</label>
-      <input id="formats" value="srt,vtt,html,txt,json" />
+      <label for="timestamp_level">Timestamp Level</label>
+      <select id="timestamp_level">
+        <option value="segment" selected>Segment</option>
+        <option value="word">Word</option>
+      </select>
     </div>
     <div>
       <label for="batch_label">Batch Label</label>
       <input id="batch_label" placeholder="Optional" />
+    </div>
+    <div>
+      <label for="translation_enabled">Translation</label>
+      <select id="translation_enabled">
+        <option value="true" selected>Enabled</option>
+        <option value="false">Disabled</option>
+      </select>
+    </div>
+    <div>
+      <label for="target_language">Target Language</label>
+      <input id="target_language" placeholder="Optional, e.g. fr" />
     </div>
     <div>
       <label for="diarization_enabled">Diarization</label>
@@ -39,7 +49,24 @@
       <label for="speaker_count">Speaker Count</label>
       <input id="speaker_count" type="number" placeholder="Optional" />
     </div>
+    <div>
+      <label for="verbose_output">Verbose Output</label>
+      <select id="verbose_output">
+        <option value="false" selected>Disabled</option>
+        <option value="true">Enabled (include provider raw metadata in JSON)</option>
+      </select>
+    </div>
   </div>
+
+  <h3>Output Formats</h3>
+  <div class="grid two">
+    <label><input class="format-checkbox" type="checkbox" value="srt" checked /> SRT</label>
+    <label><input class="format-checkbox" type="checkbox" value="vtt" checked /> VTT</label>
+    <label><input class="format-checkbox" type="checkbox" value="html" checked /> HTML</label>
+    <label><input class="format-checkbox" type="checkbox" value="txt" checked /> TXT</label>
+    <label><input class="format-checkbox" type="checkbox" value="json" checked /> JSON</label>
+  </div>
+  <p class="muted" id="model-capability-note"></p>
 
   <h3>Upload Files</h3>
   <input id="files" type="file" multiple />
@@ -60,6 +87,12 @@
 const capabilities = {{ capabilities | tojson }};
 const providerSelect = document.getElementById("provider");
 const modelSelect = document.getElementById("model");
+const diarizationSelect = document.getElementById("diarization_enabled");
+const speakerCountInput = document.getElementById("speaker_count");
+const translationSelect = document.getElementById("translation_enabled");
+const targetLanguageInput = document.getElementById("target_language");
+const capabilityNote = document.getElementById("model-capability-note");
+const formatCheckboxes = Array.from(document.querySelectorAll(".format-checkbox"));
 
 for (const provider of capabilities.providers) {
   const option = document.createElement("option");
@@ -78,24 +111,76 @@ function syncModels() {
     option.textContent = model.id;
     modelSelect.appendChild(option);
   }
+  applyModelCapabilities();
 }
-providerSelect.addEventListener("change", syncModels);
-syncModels();
+
+function selectedModelCapability() {
+  const selectedProvider = providerSelect.value;
+  const selectedModel = modelSelect.value;
+  const provider = capabilities.providers.find((item) => item.provider === selectedProvider);
+  if (!provider) return null;
+  return provider.models.find((item) => item.id === selectedModel) || null;
+}
+
+function applyModelCapabilities() {
+  const capability = selectedModelCapability();
+  if (!capability) return;
+  diarizationSelect.disabled = !capability.supports_diarization;
+  if (!capability.supports_diarization) {
+    diarizationSelect.value = "false";
+  }
+
+  const speakerAllowed = capability.supports_diarization && capability.supports_speaker_count && diarizationSelect.value === "true";
+  speakerCountInput.disabled = !speakerAllowed;
+  if (!speakerAllowed) {
+    speakerCountInput.value = "";
+  }
+
+  capabilityNote.textContent =
+    `Max duration: ${capability.max_duration_sec}s | Max size: ${capability.max_size_mb}MB | ` +
+    `Diarization: ${capability.supports_diarization ? "yes" : "no"} | ` +
+    `Auto language: ${capability.supports_auto_language ? "yes" : "no"}`;
+}
+
+function toggleTranslationFields() {
+  const enabled = translationSelect.value === "true";
+  targetLanguageInput.disabled = !enabled;
+  if (!enabled) {
+    targetLanguageInput.value = "";
+  }
+}
+
+function selectedFormats() {
+  return formatCheckboxes.filter((item) => item.checked).map((item) => item.value);
+}
 
 function basePayload() {
+  const formats = selectedFormats();
+  if (!formats.length) {
+    throw new Error("Select at least one output format.");
+  }
   return {
     provider: providerSelect.value,
     model: modelSelect.value,
     source_language: document.getElementById("source_language").value || "auto",
-    target_language: document.getElementById("target_language").value || null,
-    formats: document.getElementById("formats").value,
+    target_language: targetLanguageInput.value || null,
+    formats: formats.join(","),
     diarization_enabled: document.getElementById("diarization_enabled").value === "true",
     speaker_count: document.getElementById("speaker_count").value || "",
-    translation_enabled: true,
+    translation_enabled: translationSelect.value === "true",
     sync_preferred: true,
+    timestamp_level: document.getElementById("timestamp_level").value,
+    verbose_output: document.getElementById("verbose_output").value === "true",
     batch_label: document.getElementById("batch_label").value || "",
   };
 }
+
+providerSelect.addEventListener("change", syncModels);
+modelSelect.addEventListener("change", applyModelCapabilities);
+diarizationSelect.addEventListener("change", applyModelCapabilities);
+translationSelect.addEventListener("change", toggleTranslationFields);
+syncModels();
+toggleTranslationFields();
 
 document.getElementById("submit-upload").addEventListener("click", async () => {
   const filesInput = document.getElementById("files");
@@ -103,7 +188,13 @@ document.getElementById("submit-upload").addEventListener("click", async () => {
     alert("Select one or more files.");
     return;
   }
-  const payload = basePayload();
+  let payload;
+  try {
+    payload = basePayload();
+  } catch (error) {
+    alert(error.message || String(error));
+    return;
+  }
   const form = new FormData();
   for (const file of filesInput.files) {
     form.append("files", file);
@@ -130,8 +221,14 @@ if (folderButton) {
       alert("Enter a folder path.");
       return;
     }
-    const payload = basePayload();
-    payload.formats = payload.formats.split(",").map((x) => x.trim()).filter(Boolean);
+    let payload;
+    try {
+      payload = basePayload();
+    } catch (error) {
+      alert(error.message || String(error));
+      return;
+    }
+    payload.formats = selectedFormats();
     payload.folder_path = folderPath;
     payload.files_count = 1;
     const res = await fetch("/api/jobs/from-folder", {

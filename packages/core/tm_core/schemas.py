@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 ProviderName = Literal["whisper-local", "openai", "elevenlabs-scribe", "deepgram"]
 TranslationBackend = Literal["native", "openai", "deepgram"]
 OutputFormat = Literal["srt", "vtt", "html", "txt", "json"]
+TimestampLevel = Literal["segment", "word"]
 ArtifactVariant = Literal["source", "translated", "combined"]
 ArtifactKind = Literal["source", "translated", "combined", "bundle"]
 InputSource = Literal["upload", "folder"]
@@ -25,6 +26,8 @@ class JobCreateRequest(BaseModel):
     speaker_count: int | None = None
     translation_enabled: bool = True
     sync_preferred: bool = True
+    timestamp_level: TimestampLevel = "segment"
+    verbose_output: bool = False
 
     @field_validator("formats")
     @classmethod
