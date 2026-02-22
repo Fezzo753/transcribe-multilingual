@@ -78,6 +78,18 @@ export function isSupportedProvider(value: string): value is ProviderName {
   return PROVIDERS.some((provider) => provider.provider === value);
 }
 
+function providerConfig(provider: ProviderName): (typeof PROVIDERS)[number] {
+  const config = PROVIDERS.find((item) => item.provider === provider);
+  if (!config) {
+    throw new Error(`unsupported provider '${provider}'`);
+  }
+  return config;
+}
+
+function isSupportedModel(provider: ProviderName, model: string): boolean {
+  return providerConfig(provider).models.includes(model);
+}
+
 export function parseRequestedFormats(raw: string): OutputFormat[] {
   const parsed = raw
     .split(",")
@@ -94,12 +106,31 @@ export function parseRequestedFormats(raw: string): OutputFormat[] {
   return parsed as OutputFormat[];
 }
 
+function parseRequestedFormatsFromForm(form: FormData): OutputFormat[] {
+  const entries = form
+    .getAll("formats")
+    .map((entry) => String(entry).trim())
+    .filter(Boolean);
+  if (entries.length === 0) {
+    throw new Error("at least one output format is required");
+  }
+  return parseRequestedFormats(entries.join(","));
+}
+
 function parseTimestampLevel(raw: string): TimestampLevel {
   const normalized = raw.trim().toLowerCase();
   if (normalized !== "segment" && normalized !== "word") {
     throw new Error("timestamp_level must be 'segment' or 'word'");
   }
   return normalized as TimestampLevel;
+}
+
+function parseBooleanFlag(value: FormDataEntryValue | null, fallback: boolean): boolean {
+  if (value == null) return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
 }
 
 function escapeHtml(value: string): string {
@@ -629,32 +660,41 @@ app.post("/api/jobs", async (c) => {
   const provider = String(form.get("provider") || "") as ProviderName;
   const model = String(form.get("model") || "");
   const sourceLanguage = String(form.get("source_language") || "auto");
-  const targetLanguage = form.get("target_language") ? String(form.get("target_language")) : null;
-  const translationEnabled = String(form.get("translation_enabled") || "true") !== "false";
-  const diarizationEnabled = String(form.get("diarization_enabled") || "false") === "true";
-  const syncPreferred = String(form.get("sync_preferred") || "true") !== "false";
+  const translationEnabled = parseBooleanFlag(form.get("translation_enabled"), false);
+  const diarizationEnabled = parseBooleanFlag(form.get("diarization_enabled"), false);
+  const syncPreferred = parseBooleanFlag(form.get("sync_preferred"), true);
+  const verboseOutput = parseBooleanFlag(form.get("verbose_output"), false);
+  const targetLanguageRaw = form.get("target_language") ? String(form.get("target_language")).trim() : "";
+  const targetLanguage = translationEnabled && targetLanguageRaw ? targetLanguageRaw : null;
   let timestampLevel: TimestampLevel;
   try {
     timestampLevel = parseTimestampLevel(String(form.get("timestamp_level") || "segment"));
   } catch (error) {
     return c.json({ error: String(error instanceof Error ? error.message : error) }, 400);
   }
-  const verboseOutput = String(form.get("verbose_output") || "false") === "true";
   const speakerCountRaw = String(form.get("speaker_count") || "").trim();
   const speakerCount = speakerCountRaw ? Number(speakerCountRaw) : null;
   const batchLabel = form.get("batch_label") ? String(form.get("batch_label")) : null;
   let formats: OutputFormat[];
   try {
-    formats = parseRequestedFormats(String(form.get("formats") || "json,txt"));
+    formats = parseRequestedFormatsFromForm(form);
   } catch (error) {
     return c.json({ error: String(error instanceof Error ? error.message : error) }, 400);
-  }
-  if (speakerCount !== null && !Number.isFinite(speakerCount)) {
-    return c.json({ error: "speaker_count must be a valid number" }, 400);
   }
   const files = form.getAll("files").filter((item): item is File => item instanceof File);
   if (!files.length) return c.json({ error: "at least one file is required" }, 400);
   if (!isSupportedProvider(provider)) return c.json({ error: "unsupported provider" }, 400);
+  if (!model) return c.json({ error: "model is required" }, 400);
+  if (!isSupportedModel(provider, model)) {
+    return c.json({ error: `unsupported model '${model}' for provider '${provider}'` }, 400);
+  }
+  if (translationEnabled && !targetLanguage) {
+    return c.json({ error: "target_language is required when translation_enabled is true" }, 400);
+  }
+  if (speakerCount !== null && (!Number.isFinite(speakerCount) || !Number.isInteger(speakerCount) || speakerCount < 1)) {
+    return c.json({ error: "speaker_count must be a positive integer" }, 400);
+  }
+  const effectiveSpeakerCount = diarizationEnabled ? speakerCount : null;
 
   const jobId = uid();
   const time = nowIso();
@@ -671,7 +711,7 @@ app.post("/api/jobs", async (c) => {
       JSON.stringify({
         formats,
         diarization_enabled: diarizationEnabled,
-        speaker_count: speakerCount,
+        speaker_count: effectiveSpeakerCount,
         sync_preferred: syncPreferred,
         timestamp_level: timestampLevel,
         verbose_output: verboseOutput,
@@ -789,13 +829,137 @@ app.get("/jobs", () =>
     { headers: { "content-type": "text/html; charset=utf-8" } },
   ));
 app.get("/jobs/new", () =>
-  new Response(
-    page(
-      "New Job",
-      `<h2>Create Job</h2><form id="f"><label>Provider <select name="provider"><option value="openai">openai</option><option value="elevenlabs-scribe">elevenlabs-scribe</option><option value="deepgram">deepgram</option></select></label><br/><label>Model <input name="model" value="gpt-4o-mini-transcribe"/></label><br/><label>Formats <input name="formats" value="srt,vtt,html,txt,json"/></label><br/><input type="file" name="files" multiple/><br/><button type="submit">Submit</button></form><pre id="r"></pre><script>document.getElementById('f').addEventListener('submit',async(e)=>{e.preventDefault();const res=await fetch('/api/jobs',{method:'POST',body:new FormData(e.target)});document.getElementById('r').textContent=await res.text();});</script>`,
-    ),
-    { headers: { "content-type": "text/html; charset=utf-8" } },
-  ));
+  {
+    const providerOptions = PROVIDERS.map((provider, index) => {
+      const selected = index === 0 ? ' selected="selected"' : "";
+      return `<option value="${provider.provider}"${selected}>${provider.provider}</option>`;
+    }).join("");
+    const initialModels = PROVIDERS[0].models;
+    const modelOptions = initialModels.map((model, index) => {
+      const selected = index === 0 ? ' selected="selected"' : "";
+      return `<option value="${model}"${selected}>${model}</option>`;
+    }).join("");
+    const providerModels = Object.fromEntries(PROVIDERS.map((provider) => [provider.provider, provider.models]));
+    const formatCheckboxes = VALID_FORMATS.map((format) => {
+      const checked = format === "txt" || format === "json" ? ' checked="checked"' : "";
+      return `<label style="margin-right:12px;"><input type="checkbox" name="formats" value="${format}"${checked}/> ${format}</label>`;
+    }).join("");
+    return new Response(
+      page(
+        "New Job",
+        `<h2>Create Job</h2>
+        <form id="job-form">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;max-width:960px;">
+            <label>Provider
+              <select id="provider-select" name="provider" required>${providerOptions}</select>
+            </label>
+            <label>Model
+              <select id="model-select" name="model" required>${modelOptions}</select>
+            </label>
+            <label>Source Language
+              <input name="source_language" value="auto" placeholder="auto or ISO code"/>
+            </label>
+            <label>Timestamp Level
+              <select name="timestamp_level">
+                <option value="segment" selected="selected">segment</option>
+                <option value="word">word</option>
+              </select>
+            </label>
+            <label>Speaker Count
+              <input id="speaker-count" type="number" name="speaker_count" min="1" step="1" placeholder="optional"/>
+            </label>
+            <label>Target Language
+              <input id="target-language" name="target_language" placeholder="e.g. es, fr, de"/>
+            </label>
+            <label>Batch Label
+              <input name="batch_label" placeholder="optional label"/>
+            </label>
+          </div>
+          <fieldset style="margin-top:14px;">
+            <legend>Output Formats</legend>
+            ${formatCheckboxes}
+          </fieldset>
+          <fieldset style="margin-top:14px;">
+            <legend>Job Options</legend>
+            <label style="margin-right:12px;"><input id="translation-enabled" type="checkbox"/> Translation Enabled</label>
+            <label style="margin-right:12px;"><input id="diarization-enabled" type="checkbox" name="diarization_enabled"/> Diarization</label>
+            <label style="margin-right:12px;"><input id="verbose-output" type="checkbox" name="verbose_output"/> Verbose Output</label>
+            <label style="margin-right:12px;"><input id="sync-preferred" type="checkbox" name="sync_preferred" checked="checked"/> Prefer Sync (if eligible)</label>
+          </fieldset>
+          <div style="margin-top:14px;">
+            <input type="file" name="files" multiple required />
+          </div>
+          <div style="margin-top:14px;">
+            <button type="submit">Submit Job</button>
+          </div>
+        </form>
+        <pre id="job-response"></pre>
+        <script>
+          const providerModels = ${JSON.stringify(providerModels)};
+          const form = document.getElementById('job-form');
+          const result = document.getElementById('job-response');
+          const providerSelect = document.getElementById('provider-select');
+          const modelSelect = document.getElementById('model-select');
+          const translationToggle = document.getElementById('translation-enabled');
+          const targetLanguage = document.getElementById('target-language');
+          const diarizationToggle = document.getElementById('diarization-enabled');
+          const speakerCount = document.getElementById('speaker-count');
+          const verboseOutput = document.getElementById('verbose-output');
+          const syncPreferred = document.getElementById('sync-preferred');
+
+          function refreshModels() {
+            const models = providerModels[providerSelect.value] || [];
+            const selected = modelSelect.value;
+            modelSelect.innerHTML = models.map((model) => '<option value="' + model + '">' + model + '</option>').join('');
+            if (models.includes(selected)) {
+              modelSelect.value = selected;
+            }
+          }
+
+          function refreshTranslation() {
+            targetLanguage.disabled = !translationToggle.checked;
+            if (!translationToggle.checked) {
+              targetLanguage.value = '';
+            }
+          }
+
+          function refreshDiarization() {
+            speakerCount.disabled = !diarizationToggle.checked;
+            if (!diarizationToggle.checked) {
+              speakerCount.value = '';
+            }
+          }
+
+          providerSelect.addEventListener('change', refreshModels);
+          translationToggle.addEventListener('change', refreshTranslation);
+          diarizationToggle.addEventListener('change', refreshDiarization);
+          refreshModels();
+          refreshTranslation();
+          refreshDiarization();
+
+          form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const body = new FormData(form);
+            if (body.getAll('formats').length === 0) {
+              result.textContent = JSON.stringify({ error: 'at least one output format is required' }, null, 2);
+              return;
+            }
+            body.set('translation_enabled', translationToggle.checked ? 'true' : 'false');
+            body.set('diarization_enabled', diarizationToggle.checked ? 'true' : 'false');
+            body.set('verbose_output', verboseOutput.checked ? 'true' : 'false');
+            body.set('sync_preferred', syncPreferred.checked ? 'true' : 'false');
+            if (!translationToggle.checked) {
+              body.delete('target_language');
+            }
+            const response = await fetch('/api/jobs', { method: 'POST', body });
+            const payload = await response.text();
+            result.textContent = payload;
+          });
+        </script>`,
+      ),
+      { headers: { "content-type": "text/html; charset=utf-8" } },
+    );
+  });
 
 export async function cleanupExpiredData(env: Env): Promise<void> {
   const days = Number((await getSetting(env, "retention_days")) || env.RETENTION_DAYS || "7");

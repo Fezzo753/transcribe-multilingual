@@ -428,6 +428,66 @@ describe("cloudflare worker fixes", () => {
     expect(response.status).toBe(400);
   });
 
+  it("renders jobs/new with provider-model mapping and advanced controls", async () => {
+    const env = createEnv();
+    const response = await app.request("http://worker.local/jobs/new", { method: "GET" }, env as never);
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain('id="provider-select"');
+    expect(html).toContain('id="model-select"');
+    expect(html).toContain('name="formats" value="srt"');
+    expect(html).toContain('name="timestamp_level"');
+    expect(html).toContain('id="translation-enabled"');
+    expect(html).toContain('id="diarization-enabled"');
+    expect(html).toContain('id="verbose-output"');
+    expect(html).toContain('"openai":["gpt-4o-mini-transcribe","whisper-1"]');
+  });
+
+  it("stores advanced job options when using checkbox-style form fields", async () => {
+    const env = createEnv();
+    const form = new FormData();
+    form.set("provider", "openai");
+    form.set("model", "whisper-1");
+    form.set("source_language", "en");
+    form.set("translation_enabled", "true");
+    form.set("target_language", "fr");
+    form.set("diarization_enabled", "true");
+    form.set("speaker_count", "2");
+    form.set("timestamp_level", "word");
+    form.set("verbose_output", "true");
+    form.set("sync_preferred", "false");
+    form.append("formats", "txt");
+    form.append("formats", "json");
+    form.set("files", new File([new Uint8Array([1, 2, 3])], "sample.wav", { type: "audio/wav" }));
+
+    const response = await app.request("http://worker.local/api/jobs", { method: "POST", body: form }, env as never);
+    expect(response.status).toBe(200);
+    const payload = (await response.json()) as { id: string };
+    const job = env.DB.jobs.get(payload.id);
+    expect(job).toBeTruthy();
+    expect(job?.translation_enabled).toBe(1);
+    const options = JSON.parse(String(job?.options_json)) as Record<string, unknown>;
+    expect(options.formats).toEqual(["txt", "json"]);
+    expect(options.diarization_enabled).toBe(true);
+    expect(options.speaker_count).toBe(2);
+    expect(options.timestamp_level).toBe("word");
+    expect(options.verbose_output).toBe(true);
+    expect(options.sync_preferred).toBe(false);
+  });
+
+  it("rejects model values that are incompatible with provider", async () => {
+    const env = createEnv();
+    const form = new FormData();
+    form.set("provider", "deepgram");
+    form.set("model", "whisper-1");
+    form.append("formats", "txt");
+    form.set("files", new File([new Uint8Array([1, 2, 3])], "sample.wav", { type: "audio/wav" }));
+    const response = await app.request("http://worker.local/api/jobs", { method: "POST", body: form }, env as never);
+    expect(response.status).toBe(400);
+    const payload = (await response.json()) as Record<string, unknown>;
+    expect(String(payload.error || "")).toContain("unsupported model");
+  });
+
   it("stops processing additional files after cancellation is observed", async () => {
     const env = createEnv();
     const now = new Date().toISOString();
