@@ -156,6 +156,8 @@ class JobService:
             "diarization_enabled": request.diarization_enabled,
             "speaker_count": request.speaker_count,
             "sync_preferred": request.sync_preferred,
+            "timestamp_level": request.timestamp_level,
+            "verbose_output": request.verbose_output,
             "batch_label": request.batch_label,
             "local_folder": request.local_folder,
         }
@@ -240,6 +242,8 @@ class JobService:
         formats = options.get("formats") or ["json", "txt"]
         diarization_enabled = bool(options.get("diarization_enabled", False))
         speaker_count = options.get("speaker_count")
+        timestamp_level = str(options.get("timestamp_level") or "segment")
+        verbose_output = bool(options.get("verbose_output", False))
         fallback_order = self._effective_fallback_order()
         processed = 0
         failed = 0
@@ -257,6 +261,8 @@ class JobService:
                     source_language=job["source_language"],
                     diarization_enabled=diarization_enabled,
                     speaker_count=speaker_count,
+                    timestamp_level=timestamp_level,
+                    verbose_output=verbose_output,
                 )
 
                 warning_payload = None

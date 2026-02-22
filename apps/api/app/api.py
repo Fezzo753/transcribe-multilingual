@@ -43,6 +43,13 @@ def _parse_formats(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _parse_timestamp_level(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in {"segment", "word"}:
+        raise ValueError("timestamp_level must be 'segment' or 'word'")
+    return normalized
+
+
 def _resolve_effective_settings(settings: Settings, db: Database) -> AppSettingsResponse:
     sync_size_threshold_mb = int(db.get_app_setting("sync_size_threshold_mb") or settings.sync_size_threshold_mb)
     retention_days = int(db.get_app_setting("retention_days") or settings.retention_days)
@@ -145,25 +152,33 @@ async def create_job_upload(
     speaker_count: int | None = Form(None),
     translation_enabled: bool = Form(True),
     sync_preferred: bool = Form(True),
+    timestamp_level: str = Form("segment"),
+    verbose_output: bool = Form(False),
     batch_label: str | None = Form(None),
     storage: StorageService = Depends(get_storage),
     service: JobService = Depends(get_job_service),
 ) -> BatchJobStatusResponse:
     if not files:
         raise HTTPException(status_code=400, detail="at least one file is required")
-    request = BatchJobCreateRequest(
-        provider=provider,
-        model=model,
-        source_language=source_language,
-        target_language=target_language,
-        formats=_parse_formats(formats),
-        diarization_enabled=diarization_enabled,
-        speaker_count=speaker_count,
-        translation_enabled=translation_enabled,
-        sync_preferred=sync_preferred,
-        files_count=len(files),
-        batch_label=batch_label,
-    )
+    try:
+        parsed_timestamp_level = _parse_timestamp_level(timestamp_level)
+        request = BatchJobCreateRequest(
+            provider=provider,
+            model=model,
+            source_language=source_language,
+            target_language=target_language,
+            formats=_parse_formats(formats),
+            diarization_enabled=diarization_enabled,
+            speaker_count=speaker_count,
+            translation_enabled=translation_enabled,
+            sync_preferred=sync_preferred,
+            timestamp_level=parsed_timestamp_level,
+            verbose_output=verbose_output,
+            files_count=len(files),
+            batch_label=batch_label,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     inputs: list[InputMedia] = []
     job_temp_id = "pending"
     for upload in files:

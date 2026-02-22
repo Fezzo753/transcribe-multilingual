@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 
 type ProviderName = "openai" | "elevenlabs-scribe" | "deepgram";
 type OutputFormat = "srt" | "vtt" | "html" | "txt" | "json";
+type TimestampLevel = "segment" | "word";
 
 type Env = {
   DB: D1Database;
@@ -17,7 +18,13 @@ type Env = {
 };
 
 type TranscriptSegment = { id: number; start: number; end: number; text: string; translated_text?: string | null };
-type TranscriptDocument = { provider: ProviderName; model: string; detected_language?: string | null; segments: TranscriptSegment[] };
+type TranscriptDocument = {
+  provider: ProviderName;
+  model: string;
+  detected_language?: string | null;
+  segments: TranscriptSegment[];
+  metadata?: Record<string, unknown>;
+};
 
 const PROVIDERS = [
   {
@@ -85,6 +92,14 @@ export function parseRequestedFormats(raw: string): OutputFormat[] {
     }
   }
   return parsed as OutputFormat[];
+}
+
+function parseTimestampLevel(raw: string): TimestampLevel {
+  const normalized = raw.trim().toLowerCase();
+  if (normalized !== "segment" && normalized !== "word") {
+    throw new Error("timestamp_level must be 'segment' or 'word'");
+  }
+  return normalized as TimestampLevel;
 }
 
 function escapeHtml(value: string): string {
@@ -195,12 +210,20 @@ function render(document: TranscriptDocument, format: OutputFormat, variant: "so
   throw new Error(`unsupported output format '${format}'`);
 }
 
-async function transcribeOpenAI(apiKey: string, model: string, file: File, sourceLanguage: string): Promise<TranscriptDocument> {
+async function transcribeOpenAI(
+  apiKey: string,
+  model: string,
+  file: File,
+  sourceLanguage: string,
+  timestampLevel: TimestampLevel,
+  verboseOutput: boolean,
+): Promise<TranscriptDocument> {
   const form = new FormData();
   form.set("file", file, file.name);
   form.set("model", model);
   form.set("response_format", "verbose_json");
   if (sourceLanguage !== "auto") form.set("language", sourceLanguage);
+  form.set("timestamp_granularities[]", timestampLevel);
   const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}` },
@@ -217,7 +240,8 @@ async function transcribeOpenAI(apiKey: string, model: string, file: File, sourc
         text: String(s.text ?? ""),
       }))
     : [{ id: 1, start: 0, end: 0, text: String(payload.text ?? "") }];
-  return { provider: "openai", model, detected_language: (payload.language as string | undefined) || null, segments };
+  const metadata = verboseOutput ? { raw_response: payload } : undefined;
+  return { provider: "openai", model, detected_language: (payload.language as string | undefined) || null, segments, metadata };
 }
 
 async function transcribeDeepgram(
@@ -226,6 +250,8 @@ async function transcribeDeepgram(
   file: File,
   sourceLanguage: string,
   diarizationEnabled: boolean,
+  timestampLevel: TimestampLevel,
+  verboseOutput: boolean,
 ): Promise<TranscriptDocument> {
   let url = `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(model)}&punctuate=true&smart_format=true&diarize=${
     diarizationEnabled ? "true" : "false"
@@ -243,12 +269,28 @@ async function transcribeDeepgram(
     unknown
   >;
   const alt = (((channel.alternatives as Array<Record<string, unknown>>) || [])[0] || {}) as Record<string, unknown>;
+  const words = ((alt.words as Array<Record<string, unknown>> | undefined) || []).filter((item) => item.word || item.punctuated_word);
   const transcript = String(alt.transcript || "");
+  let segments: TranscriptSegment[] = [];
+  if (timestampLevel === "word" && words.length > 0) {
+    segments = words.map((word, idx) => ({
+      id: idx + 1,
+      start: Number(word.start || 0),
+      end: Number(word.end || 0),
+      text: String(word.punctuated_word || word.word || ""),
+      translated_text: null,
+    }));
+  }
+  if (segments.length === 0) {
+    segments = [{ id: 1, start: 0, end: 0, text: transcript }];
+  }
+  const metadata = verboseOutput ? { raw_response: payload } : undefined;
   return {
     provider: "deepgram",
     model,
     detected_language: String((payload.results as Record<string, unknown>)?.detected_language || "") || null,
-    segments: [{ id: 1, start: 0, end: 0, text: transcript }],
+    segments,
+    metadata,
   };
 }
 
@@ -259,6 +301,8 @@ async function transcribeElevenlabs(
   sourceLanguage: string,
   diarizationEnabled: boolean,
   speakerCount: number | null,
+  timestampLevel: TimestampLevel,
+  verboseOutput: boolean,
 ): Promise<TranscriptDocument> {
   const form = new FormData();
   form.set("file", file, file.name);
@@ -277,11 +321,23 @@ async function transcribeElevenlabs(
   });
   const payload = (await response.json()) as Record<string, unknown>;
   if (!response.ok) throw new Error(`elevenlabs transcription failed: ${JSON.stringify(payload)}`);
+  const words = ((payload.words as Array<Record<string, unknown>> | undefined) || []).filter((item) => item.word || item.punctuated_word);
+  const segments =
+    timestampLevel === "word" && words.length > 0
+      ? words.map((word, idx) => ({
+          id: idx + 1,
+          start: Number(word.start || 0),
+          end: Number(word.end || 0),
+          text: String(word.punctuated_word || word.word || ""),
+        }))
+      : [{ id: 1, start: 0, end: 0, text: String(payload.text || "") }];
+  const metadata = verboseOutput ? { raw_response: payload } : undefined;
   return {
     provider: "elevenlabs-scribe",
     model,
     detected_language: String(payload.language_code || "") || null,
-    segments: [{ id: 1, start: 0, end: 0, text: String(payload.text || "") }],
+    segments,
+    metadata,
   };
 }
 
@@ -293,12 +349,14 @@ async function transcribe(
   sourceLanguage: string,
   diarizationEnabled: boolean,
   speakerCount: number | null,
+  timestampLevel: TimestampLevel,
+  verboseOutput: boolean,
 ): Promise<TranscriptDocument> {
   const key = await getProviderKey(env, provider);
   if (!key) throw new Error(`missing API key for ${provider}`);
-  if (provider === "openai") return transcribeOpenAI(key, model, file, sourceLanguage);
-  if (provider === "deepgram") return transcribeDeepgram(key, model, file, sourceLanguage, diarizationEnabled);
-  return transcribeElevenlabs(key, model, file, sourceLanguage, diarizationEnabled, speakerCount);
+  if (provider === "openai") return transcribeOpenAI(key, model, file, sourceLanguage, timestampLevel, verboseOutput);
+  if (provider === "deepgram") return transcribeDeepgram(key, model, file, sourceLanguage, diarizationEnabled, timestampLevel, verboseOutput);
+  return transcribeElevenlabs(key, model, file, sourceLanguage, diarizationEnabled, speakerCount, timestampLevel, verboseOutput);
 }
 
 export async function applyTranslation(
@@ -395,6 +453,8 @@ export async function processJob(env: Env, jobId: string): Promise<void> {
   const parsedSpeakerCount =
     speakerCountRaw == null || speakerCountRaw === "" ? null : Number(speakerCountRaw);
   const speakerCount = typeof parsedSpeakerCount === "number" && Number.isFinite(parsedSpeakerCount) ? parsedSpeakerCount : null;
+  const timestampLevel = options.timestamp_level === "word" ? "word" : "segment";
+  const verboseOutput = Boolean(options.verbose_output ?? false);
   let processed = 0;
   let failed = 0;
   let cancelled = false;
@@ -419,6 +479,8 @@ export async function processJob(env: Env, jobId: string): Promise<void> {
         String(job.source_language),
         diarizationEnabled,
         speakerCount,
+        timestampLevel,
+        verboseOutput,
       );
       if (Number(job.translation_enabled) && job.target_language) {
         document = await applyTranslation(env, String(job.provider) as ProviderName, document, String(job.target_language), document.detected_language || null);
@@ -571,6 +633,13 @@ app.post("/api/jobs", async (c) => {
   const translationEnabled = String(form.get("translation_enabled") || "true") !== "false";
   const diarizationEnabled = String(form.get("diarization_enabled") || "false") === "true";
   const syncPreferred = String(form.get("sync_preferred") || "true") !== "false";
+  let timestampLevel: TimestampLevel;
+  try {
+    timestampLevel = parseTimestampLevel(String(form.get("timestamp_level") || "segment"));
+  } catch (error) {
+    return c.json({ error: String(error instanceof Error ? error.message : error) }, 400);
+  }
+  const verboseOutput = String(form.get("verbose_output") || "false") === "true";
   const speakerCountRaw = String(form.get("speaker_count") || "").trim();
   const speakerCount = speakerCountRaw ? Number(speakerCountRaw) : null;
   const batchLabel = form.get("batch_label") ? String(form.get("batch_label")) : null;
@@ -604,6 +673,8 @@ app.post("/api/jobs", async (c) => {
         diarization_enabled: diarizationEnabled,
         speaker_count: speakerCount,
         sync_preferred: syncPreferred,
+        timestamp_level: timestampLevel,
+        verbose_output: verboseOutput,
         batch_label: batchLabel,
       }),
       time,

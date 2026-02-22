@@ -19,6 +19,8 @@ class ProviderAdapter(Protocol):
         source_language: str = "auto",
         diarization_enabled: bool = False,
         speaker_count: int | None = None,
+        timestamp_level: str = "segment",
+        verbose_output: bool = False,
     ) -> TranscriptDocument:
         raise NotImplementedError
 
@@ -73,6 +75,24 @@ def _build_segments_from_words(words: list[dict[str, Any]]) -> list[TranscriptSe
     return segments
 
 
+def _build_word_segments_from_words(words: list[dict[str, Any]]) -> list[TranscriptSegment]:
+    segments: list[TranscriptSegment] = []
+    for idx, word in enumerate(words, start=1):
+        text = str(word.get("punctuated_word") or word.get("word") or "").strip()
+        if not text:
+            continue
+        segments.append(
+            TranscriptSegment(
+                id=idx,
+                start=float(word.get("start", 0.0)),
+                end=float(word.get("end", 0.0)),
+                text=text,
+                speaker=f"spk-{word['speaker']}" if word.get("speaker") is not None else None,
+            )
+        )
+    return segments
+
+
 def _single_segment_from_text(text: str) -> list[TranscriptSegment]:
     normalized = text.strip()
     if not normalized:
@@ -120,8 +140,10 @@ class WhisperLocalAdapter:
         source_language: str = "auto",
         diarization_enabled: bool = False,
         speaker_count: int | None = None,
+        timestamp_level: str = "segment",
+        verbose_output: bool = False,
     ) -> TranscriptDocument:
-        del diarization_enabled, speaker_count
+        del diarization_enabled, speaker_count, timestamp_level
         try:
             from faster_whisper import WhisperModel  # type: ignore
         except Exception as exc:  # pragma: no cover - optional dependency
@@ -154,8 +176,20 @@ class WhisperLocalAdapter:
                     text=str(segment.text).strip(),
                 )
             )
+        metadata: dict[str, Any] = {}
+        if verbose_output:
+            metadata["runtime"] = {"device": device, "compute_type": compute_type}
+            metadata["model_info"] = {
+                "language": getattr(info, "language", None),
+                "duration": getattr(info, "duration", None),
+                "duration_after_vad": getattr(info, "duration_after_vad", None),
+            }
         return TranscriptDocument(
-            provider=self.provider, model=model, detected_language=getattr(info, "language", None), segments=segments
+            provider=self.provider,
+            model=model,
+            detected_language=getattr(info, "language", None),
+            segments=segments,
+            metadata=metadata,
         )
 
 
@@ -171,12 +205,15 @@ class OpenAIAdapter:
         source_language: str = "auto",
         diarization_enabled: bool = False,
         speaker_count: int | None = None,
+        timestamp_level: str = "segment",
+        verbose_output: bool = False,
     ) -> TranscriptDocument:
         del diarization_enabled, speaker_count
         with file_path.open("rb") as handle:
             data: dict[str, Any] = {"model": model, "response_format": "verbose_json"}
             if source_language != "auto":
                 data["language"] = source_language
+            data["timestamp_granularities[]"] = timestamp_level
             payload = _provider_request(
                 "POST",
                 "https://api.openai.com/v1/audio/transcriptions",
@@ -197,12 +234,15 @@ class OpenAIAdapter:
             )
         if not segments:
             segments = _single_segment_from_text(str(payload.get("text", "")))
+        metadata: dict[str, Any] = {"request_id": payload.get("id")}
+        if verbose_output:
+            metadata["raw_response"] = payload
         return TranscriptDocument(
             provider=self.provider,
             model=model,
             detected_language=payload.get("language"),
             segments=segments,
-            metadata={"request_id": payload.get("id")},
+            metadata=metadata,
         )
 
     def translate_native(
@@ -231,7 +271,10 @@ class ElevenLabsScribeAdapter:
         source_language: str = "auto",
         diarization_enabled: bool = False,
         speaker_count: int | None = None,
+        timestamp_level: str = "segment",
+        verbose_output: bool = False,
     ) -> TranscriptDocument:
+        del timestamp_level
         with file_path.open("rb") as handle:
             data: dict[str, Any] = {"model_id": model}
             if source_language != "auto":
@@ -264,11 +307,15 @@ class ElevenLabsScribeAdapter:
             )
         if not segments:
             segments = _single_segment_from_text(str(payload.get("text", "")))
+        metadata: dict[str, Any] = {}
+        if verbose_output:
+            metadata["raw_response"] = payload
         return TranscriptDocument(
             provider=self.provider,
             model=model,
             detected_language=payload.get("language_code") or payload.get("language"),
             segments=segments,
+            metadata=metadata,
         )
 
 
@@ -284,6 +331,8 @@ class DeepgramAdapter:
         source_language: str = "auto",
         diarization_enabled: bool = False,
         speaker_count: int | None = None,
+        timestamp_level: str = "segment",
+        verbose_output: bool = False,
     ) -> TranscriptDocument:
         del speaker_count
         url = (
@@ -303,14 +352,21 @@ class DeepgramAdapter:
         channel = ((payload.get("results") or {}).get("channels") or [{}])[0]
         alternative = (channel.get("alternatives") or [{}])[0]
         words = alternative.get("words") or []
-        segments = _build_segments_from_words(words)
+        if timestamp_level == "word":
+            segments = _build_word_segments_from_words(words)
+        else:
+            segments = _build_segments_from_words(words)
         if not segments:
             segments = _single_segment_from_text(str(alternative.get("transcript", "")))
+        metadata: dict[str, Any] = {}
+        if verbose_output:
+            metadata["raw_response"] = payload
         return TranscriptDocument(
             provider=self.provider,
             model=model,
             detected_language=payload.get("results", {}).get("detected_language"),
             segments=segments,
+            metadata=metadata,
         )
 
     def translate_native(
