@@ -65,6 +65,12 @@ function safePrefix(name: string): string {
   return stem.replace(/[^a-z0-9._-]+/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "") || "file";
 }
 
+function safeUploadName(name: string): string {
+  const trimmed = name.trim();
+  const basename = trimmed.split(/[\\/]/).pop() || "";
+  return basename || "upload.bin";
+}
+
 function parseJson<T>(raw: string | null, fallback: T): T {
   if (!raw) return fallback;
   try {
