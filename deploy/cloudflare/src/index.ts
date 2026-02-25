@@ -931,7 +931,151 @@ app.get("/jobs", () =>
   new Response(
     page(
       "Jobs",
-      `<h2>Jobs</h2><pre id="jobs">Loading...</pre><script>fetch('/api/jobs').then(r=>r.json()).then(d=>document.getElementById('jobs').textContent=JSON.stringify(d,null,2));</script>`,
+      `<h2>Jobs</h2>
+      <p>Inspect previous jobs, copy output JSON, and download bundles/artifacts.</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px;align-items:start;">
+        <section>
+          <div style="margin-bottom:10px;">
+            <button type="button" id="refresh-jobs">Refresh Jobs</button>
+          </div>
+          <div style="overflow:auto;max-height:70vh;border:1px solid #ddd;">
+            <table style="border-collapse:collapse;width:100%;">
+              <thead>
+                <tr>
+                  <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">Job ID</th>
+                  <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">Status</th>
+                  <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">Provider</th>
+                  <th style="text-align:left;border-bottom:1px solid #ddd;padding:8px;">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="jobs-table-body">
+                <tr><td colspan="4" style="padding:8px;">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+        <section>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+            <strong>Output</strong>
+            <button type="button" id="copy-job-output">Copy Output</button>
+          </div>
+          <pre id="job-output" style="min-height:220px;border:1px solid #ddd;padding:12px;overflow:auto;">Select a job to view details.</pre>
+          <h3 style="margin-top:14px;">Downloads</h3>
+          <ul id="job-downloads">
+            <li>Select a job to list downloadable artifacts.</li>
+          </ul>
+        </section>
+      </div>
+      <script>
+        const jobsBody = document.getElementById('jobs-table-body');
+        const outputPre = document.getElementById('job-output');
+        const downloadsList = document.getElementById('job-downloads');
+        const refreshButton = document.getElementById('refresh-jobs');
+        const copyButton = document.getElementById('copy-job-output');
+        let selectedJobId = null;
+
+        function escapeHtml(value) {
+          return String(value)
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#039;');
+        }
+
+        function renderJobsTable(rows) {
+          if (!rows.length) {
+            jobsBody.innerHTML = '<tr><td colspan="4" style="padding:8px;">No jobs found.</td></tr>';
+            return;
+          }
+          jobsBody.innerHTML = rows.map((job) => {
+            const isSelected = selectedJobId === job.id;
+            const viewLabel = isSelected ? 'Viewing' : 'View Output';
+            const bundleLink = '<a href="/api/jobs/' + encodeURIComponent(job.id) + '/bundle.zip">Bundle</a>';
+            return '<tr>' +
+              '<td style="border-bottom:1px solid #eee;padding:8px;"><code>' + escapeHtml(job.id) + '</code></td>' +
+              '<td style="border-bottom:1px solid #eee;padding:8px;">' + escapeHtml(job.status || '') + '</td>' +
+              '<td style="border-bottom:1px solid #eee;padding:8px;">' + escapeHtml((job.provider || '') + ' / ' + (job.model || '')) + '</td>' +
+              '<td style="border-bottom:1px solid #eee;padding:8px;"><button type="button" class="view-job" data-job-id="' + escapeHtml(job.id) + '">' + viewLabel + '</button> ' + bundleLink + '</td>' +
+              '</tr>';
+          }).join('');
+        }
+
+        function renderDownloads(jobDetail) {
+          const links = [];
+          const jobId = String(jobDetail.id || '');
+          if (jobId) {
+            links.push('<li><a href="/api/jobs/' + encodeURIComponent(jobId) + '/bundle.zip">Download Bundle (.zip)</a></li>');
+          }
+          const allArtifacts = [];
+          for (const artifact of (jobDetail.artifacts || [])) {
+            allArtifacts.push(artifact);
+          }
+          for (const file of (jobDetail.files || [])) {
+            for (const artifact of (file.artifacts || [])) {
+              allArtifacts.push(artifact);
+            }
+          }
+          for (const artifact of allArtifacts) {
+            if (!artifact || !artifact.id) continue;
+            const href = '/api/jobs/' + encodeURIComponent(jobId) + '/artifacts/' + encodeURIComponent(String(artifact.id));
+            const label = artifact.name || artifact.id;
+            links.push('<li><a href="' + href + '">' + escapeHtml(label) + '</a></li>');
+          }
+          downloadsList.innerHTML = links.length ? links.join('') : '<li>No downloadable artifacts available yet.</li>';
+        }
+
+        async function viewJob(jobId) {
+          selectedJobId = jobId;
+          const response = await fetch('/api/jobs/' + encodeURIComponent(jobId));
+          if (!response.ok) {
+            outputPre.textContent = await response.text();
+            downloadsList.innerHTML = '<li>No downloadable artifacts available.</li>';
+            return;
+          }
+          const detail = await response.json();
+          outputPre.textContent = JSON.stringify(detail, null, 2);
+          renderDownloads(detail);
+          await loadJobs();
+        }
+
+        async function loadJobs() {
+          const response = await fetch('/api/jobs');
+          if (!response.ok) {
+            jobsBody.innerHTML = '<tr><td colspan="4" style="padding:8px;">' + escapeHtml(await response.text()) + '</td></tr>';
+            return;
+          }
+          const rows = await response.json();
+          renderJobsTable(rows);
+        }
+
+        jobsBody.addEventListener('click', async (event) => {
+          const target = event.target;
+          if (!(target instanceof HTMLElement)) return;
+          if (!target.classList.contains('view-job')) return;
+          const jobId = target.getAttribute('data-job-id');
+          if (!jobId) return;
+          await viewJob(jobId);
+        });
+
+        refreshButton.addEventListener('click', loadJobs);
+        copyButton.addEventListener('click', async () => {
+          const text = outputPre.textContent || '';
+          if (!text.trim()) return;
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+            return;
+          }
+          const area = document.createElement('textarea');
+          area.value = text;
+          document.body.appendChild(area);
+          area.select();
+          document.execCommand('copy');
+          document.body.removeChild(area);
+        });
+
+        loadJobs();
+      </script>`,
     ),
     { headers: { "content-type": "text/html; charset=utf-8" } },
   ));
@@ -1000,11 +1144,19 @@ app.get("/jobs/new", () =>
             <button type="submit">Submit Job</button>
           </div>
         </form>
-        <pre id="job-response"></pre>
+        <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <button type="button" id="copy-job-response">Copy Output</button>
+          <a id="open-created-job" href="#" style="display:none;">Open Job</a>
+          <a id="download-created-bundle" href="#" style="display:none;">Download Bundle</a>
+        </div>
+        <pre id="job-response">No submission yet.</pre>
         <script>
           const providerModels = ${JSON.stringify(providerModels)};
           const form = document.getElementById('job-form');
           const result = document.getElementById('job-response');
+          const copyResultButton = document.getElementById('copy-job-response');
+          const openJobLink = document.getElementById('open-created-job');
+          const bundleLink = document.getElementById('download-created-bundle');
           const providerSelect = document.getElementById('provider-select');
           const modelSelect = document.getElementById('model-select');
           const translationToggle = document.getElementById('translation-enabled');
@@ -1059,8 +1211,38 @@ app.get("/jobs/new", () =>
               body.delete('target_language');
             }
             const response = await fetch('/api/jobs', { method: 'POST', body });
-            const payload = await response.text();
-            result.textContent = payload;
+            const raw = await response.text();
+            let parsed = null;
+            try {
+              parsed = JSON.parse(raw);
+            } catch {}
+            result.textContent = parsed ? JSON.stringify(parsed, null, 2) : raw;
+            if (response.ok && parsed && parsed.id) {
+              const id = String(parsed.id);
+              openJobLink.href = '/jobs';
+              openJobLink.textContent = 'Open Job List';
+              openJobLink.style.display = 'inline';
+              bundleLink.href = '/api/jobs/' + encodeURIComponent(id) + '/bundle.zip';
+              bundleLink.style.display = 'inline';
+            } else {
+              openJobLink.style.display = 'none';
+              bundleLink.style.display = 'none';
+            }
+          });
+
+          copyResultButton.addEventListener('click', async () => {
+            const text = result.textContent || '';
+            if (!text.trim()) return;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              await navigator.clipboard.writeText(text);
+              return;
+            }
+            const area = document.createElement('textarea');
+            area.value = text;
+            document.body.appendChild(area);
+            area.select();
+            document.execCommand('copy');
+            document.body.removeChild(area);
           });
         </script>`,
       ),

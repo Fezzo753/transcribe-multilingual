@@ -454,7 +454,23 @@ describe("cloudflare worker fixes", () => {
     expect(html).toContain('id="translation-enabled"');
     expect(html).toContain('id="diarization-enabled"');
     expect(html).toContain('id="verbose-output"');
+    expect(html).toContain('id="copy-job-response"');
+    expect(html).toContain('id="open-created-job"');
+    expect(html).toContain('id="download-created-bundle"');
     expect(html).toContain('"openai":["gpt-4o-mini-transcribe","whisper-1"]');
+  });
+
+  it("renders jobs page with output copy and download controls", async () => {
+    const env = createEnv();
+    const response = await app.request("http://worker.local/jobs", { method: "GET" }, env as never);
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain('id="jobs-table-body"');
+    expect(html).toContain('id="job-output"');
+    expect(html).toContain('id="copy-job-output"');
+    expect(html).toContain('id="job-downloads"');
+    expect(html).toContain("/api/jobs/");
+    expect(html).toContain("Download Bundle (.zip)");
   });
 
   it("stores advanced job options when using checkbox-style form fields", async () => {
